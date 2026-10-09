@@ -1,0 +1,22 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python
+*.py text diff=python
+
+# Medical images
+*.nii text binary
+*.nii.gz text binary
+*.nrrd text binary
+*.mha text binary
+
+# Config
+*.yaml text
+*.yml text
+*.json text
+
+# Markdown
+*.md text
+
+# Shell
+*.sh text eol=lf

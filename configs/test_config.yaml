@@ -1,0 +1,26 @@
+# 测试配置
+model: "dino_reg_mrct"
+
+# 测试数据
+data:
+  test_dir: "data/test"
+  mode: "file_list"
+
+# 评估配置
+evaluation:
+  save_vis: true
+  max_vis: 10
+  compute_metrics:
+    - ncc
+    - mse
+    - ssim
+    - dice
+
+# 模型配置
+feature_extractor:
+  type: "dinov2"
+  model_name: "dinov2_vitl14"
+
+convex_optimizer:
+  max_iter: 200
+  lr: 0.5

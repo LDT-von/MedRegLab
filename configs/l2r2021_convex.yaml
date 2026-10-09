@@ -1,0 +1,44 @@
+# Learn2Reg 2021 Task1 (MR-CT) 配置
+# ConvexAdam 冠军方案
+
+model: "convex_mrct"
+
+# 数据配置
+data:
+  train_dir: "data/l2r2021/train"
+  val_dir: "data/l2r2021/val"
+  target_size: [192, 160, 224]  # [D, H, W]
+
+# 训练配置
+training:
+  batch_size: 1
+  num_epochs: 100
+  learning_rate: 0.5
+  optimizer: "convex_adam"
+  max_iter: 200
+
+# ConvexAdam 参数
+convex_optimizer:
+  image_sigma: 1.0
+  tensor_sigma: 0.01
+  lr: 0.5
+  momentum: 0.9
+  use_physical_priors: true
+
+# 损失配置
+losses:
+  - mse
+  - ncc
+
+loss_weights:
+  mse: 1.0
+  ncc: 1.0
+
+tv_weight: 0.1
+jacobian_weight: 0.01
+
+# 输出配置
+output:
+  save_interval: 10
+  save_vis: true
+  max_vis: 20

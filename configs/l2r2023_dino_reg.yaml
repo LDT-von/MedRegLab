@@ -1,0 +1,68 @@
+# Learn2Reg 2023 配置
+# DINO-Reg + IMPACT 冠军方案
+
+model: "dino_reg_mrct"
+
+# 数据配置
+data:
+  train_dir: "data/l2r2023/train"
+  val_dir: "data/l2r2023/val"
+  target_size: [192, 160, 224]  # [D, H, W]
+
+# 训练配置
+training:
+  batch_size: 1
+  num_epochs: 100
+  learning_rate: 1e-4
+  optimizer: "convex_adam"
+  max_iter: 200
+
+# 特征提取器配置
+feature_extractor:
+  type: "dinov2"
+  model_name: "dinov2_vitl14"
+  feature_dim: 1024
+  frozen: true
+
+# DINOv2 参数
+dino:
+  model_name: "dinov2_vitl14"
+  patch_size: 14
+
+# ConvexAdam 参数
+convex_optimizer:
+  image_sigma: 1.0
+  tensor_sigma: 0.01
+  lr: 0.5
+  momentum: 0.9
+  use_physical_priors: true
+
+# IMPACT 损失参数
+impact:
+  feature_dim: 1024
+  hidden_dim: 256
+  num_layers: 4
+  temperature: 0.1
+  semantic_weight: 0.5
+  use_contrastive: true
+
+# 损失配置
+loss_type: "impact"
+losses:
+  - mse
+  - ncc
+  - impact
+
+loss_weights:
+  mse: 1.0
+  ncc: 1.0
+  impact: 0.5
+
+tv_weight: 0.05
+jacobian_weight: 0.01
+
+# 输出配置
+output:
+  save_interval: 10
+  save_vis: true
+  max_vis: 20
