@@ -32,6 +32,7 @@ import hashlib
 import json
 import math
 import subprocess
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -380,6 +381,9 @@ def run_configuration(
 
     case_index = {case.case_id: index for index, case in enumerate(cases)}
     for case in cases:
+        case_start = time.perf_counter()
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         try:
             fixed = sitk.ReadImage(str(case.fixed_path))
             moving = sitk.ReadImage(str(case.moving_path))
@@ -429,7 +433,19 @@ def run_configuration(
                 entry.update(fold_stats)
             if config.mode == "model":
                 entry["loss"] = float(model_output["loss"])
+            entry["elapsed_seconds"] = round(time.perf_counter() - case_start, 3)
+            if device == "cuda" and torch.cuda.is_available():
+                entry["peak_gpu_gib"] = round(
+                    torch.cuda.max_memory_allocated() / (1024 ** 3), 4
+                )
             result.per_case[case.case_id] = entry
+            print(
+                f"[dev-eval] {config.name} case {case.case_id}: "
+                f"mean_dsc={scores['mean']:.4f} "
+                f"({entry['elapsed_seconds']:.1f}s"
+                + (f", {entry['peak_gpu_gib']:.2f} GiB)" if "peak_gpu_gib" in entry else ")"),
+                flush=True,
+            )
         except Exception as error:  # noqa: BLE001 - recorded, then re-raised by the caller
             result.errors.append({"case_id": case.case_id, "error": f"{type(error).__name__}: {error}"})
             raise EvaluationError(
