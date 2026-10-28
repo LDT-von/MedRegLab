@@ -225,9 +225,19 @@ def create_submission(inference_dir, data_root, output_dir, specification=None):
         report["specification"] = {"filename": spec.name, "sha256": sha256(spec)}
     (output_dir / "format_check.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     (output_dir / "submission.zip.sha256").write_text(f"{report['zip_sha256']}  submission.zip\n", encoding="ascii")
+    # Name the scheme from the JSON report instead of hard-coding one, so that a
+    # baseline package cannot claim to be a registered one.
+    scheme = str(summary.get("baseline") or summary["model"])
+    scheme_note = (
+        "基线B：模型缩放网格phi=0经displacement_to_fixed_grid转到原始CT网格，"
+        "只含CT/MR几何映射，不含任何学习到的形变。"
+        if scheme == "B_zero_model_identity"
+        else "convex_3d逐例形变优化结果。"
+    )
     (output_dir / "README.txt").write_text(
         "正式规范格式包：submission.zip\n"
-        "模型：convex_3d；病例：025-032；沿用已完成的8例推理结果。\n"
+        f"方案：{scheme}；病例：025-032；沿用已完成的8例推理结果。\n"
+        f"方案说明：{scheme_note}\n"
         "ZIP根目录为submission/，每个病例目录仅含displacement_field.nii.gz。\n"
         "最终8个文件均经SimpleITK.TransformToDisplacementField重新生成，float32、3分量。\n"
         "size/spacing/origin/direction与原始CT完全一致；位移单位mm。\n"
