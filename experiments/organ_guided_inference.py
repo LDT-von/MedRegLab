@@ -225,6 +225,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--predictions", required=True, help="Directory with organ probability maps")
     parser.add_argument("--split", default="test")
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument(
+        "--settings",
+        nargs="*",
+        default=[],
+        help="Extra engine settings, e.g. seg_weight=2 io_iters=300 reg_sp=1.5",
+    )
     args = parser.parse_args(argv)
 
     run_organ_guided_registration(
@@ -234,6 +240,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prediction_dir=Path(args.predictions),
         split=args.split,
         gpu=args.gpu,
+        extra_settings=args.settings,
     )
     return 0
 
