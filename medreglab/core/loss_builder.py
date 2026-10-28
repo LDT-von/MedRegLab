@@ -4,9 +4,9 @@ Loss Builder - 损失函数构建器
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional
+import math
 
 
 class LossBuilder:
@@ -16,10 +16,10 @@ class LossBuilder:
     支持的损失类型：
     - mse: 均方误差
     - ncc: 归一化互相关
-    - nmi: 归一化互信息
-    - impact: IMPACT 语义损失
     - tv: 全变差正则化
     - jacobian: Jacobian 行列式正则化
+
+    NMI and IMPACT are not implemented and are rejected explicitly.
     """
 
     def __init__(
@@ -39,8 +39,27 @@ class LossBuilder:
             tv_weight: 全变差正则化权重
             jacobian_weight: Jacobian 正则化权重
         """
-        self.losses = losses or ["mse", "ncc"]
-        self.weights = weights or {"mse": 1.0, "ncc": 1.0}
+        alias = kwargs.pop("loss_types", None)
+        if kwargs:
+            raise TypeError(f"Unsupported LossBuilder options: {sorted(kwargs)}")
+        if losses is not None and alias is not None:
+            raise ValueError("Specify either losses or loss_types, not both")
+        selected = losses if losses is not None else alias
+        self.losses = list(selected) if selected is not None else ["mse", "ncc"]
+        if not self.losses or len(set(self.losses)) != len(self.losses):
+            raise ValueError("Loss names must be nonempty and unique")
+        unsupported = set(self.losses) & {"nmi", "impact"}
+        if unsupported:
+            raise NotImplementedError(f"Losses not implemented: {sorted(unsupported)}")
+        unknown = set(self.losses) - {"mse", "ncc", "tv", "jacobian"}
+        if unknown:
+            raise ValueError(f"Unknown loss names: {sorted(unknown)}")
+        self.weights = dict(weights) if weights is not None else {"mse": 1.0, "ncc": 1.0}
+        if set(self.weights) - {"mse", "ncc", "tv", "jacobian"}:
+            raise ValueError("Unknown loss weight name")
+        for weight in [*self.weights.values(), impact_weight, tv_weight, jacobian_weight]:
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError("Loss weights must be finite and nonnegative")
         self.impact_weight = impact_weight
         self.tv_weight = tv_weight
         self.jacobian_weight = jacobian_weight
@@ -66,7 +85,13 @@ class LossBuilder:
         Returns:
             dict: 各损失及总损失
         """
-        total_loss = 0.0
+        if warped.shape != fixed.shape or warped.device != fixed.device:
+            raise ValueError("Warped and fixed images must have the same shape and device")
+        if features_warped is not None or features_fixed is not None:
+            raise NotImplementedError("IMPACT semantic loss is not implemented")
+        if phi is None and ({"tv", "jacobian"} & set(self.losses)):
+            raise ValueError("A displacement field is required for TV/Jacobian loss")
+        total_loss = warped.new_zeros(())
         losses = {}
 
         # 基础损失
@@ -75,31 +100,25 @@ class LossBuilder:
                 loss_val = F.mse_loss(warped, fixed)
             elif loss_name == "ncc":
                 loss_val = self._ncc_loss(warped, fixed)
-            elif loss_name == "nmi":
-                loss_val = self._nmi_loss(warped, fixed)
-            else:
+            else:  # TV and Jacobian are handled once below.
                 continue
 
             weight = self.weights.get(loss_name, 1.0)
             total_loss = total_loss + weight * loss_val
             losses[loss_name] = loss_val.item()
 
-        # IMPACT 语义损失
-        if features_warped is not None and features_fixed is not None:
-            impact_loss = self._impact_loss(features_warped, features_fixed)
-            total_loss = total_loss + self.impact_weight * impact_loss
-            losses["impact"] = impact_loss.item()
-
         # 全变差正则化
-        if phi is not None and self.tv_weight > 0:
+        tv_weight = self.weights.get("tv", self.tv_weight) if "tv" in self.losses else self.tv_weight
+        jac_weight = self.weights.get("jacobian", self.jacobian_weight) if "jacobian" in self.losses else self.jacobian_weight
+        if phi is not None and tv_weight > 0:
             tv_loss = self._tv_regularization(phi)
-            total_loss = total_loss + self.tv_weight * tv_loss
+            total_loss = total_loss + tv_weight * tv_loss
             losses["tv"] = tv_loss.item()
 
         # Jacobian 正则化
-        if phi is not None and self.jacobian_weight > 0:
+        if phi is not None and jac_weight > 0:
             jac_loss = self._jacobian_regularization(phi)
-            total_loss = total_loss + self.jacobian_weight * jac_loss
+            total_loss = total_loss + jac_weight * jac_loss
             losses["jacobian"] = jac_loss.item()
 
         losses["total"] = total_loss.item()
@@ -109,32 +128,30 @@ class LossBuilder:
 
     def _ncc_loss(self, I: torch.Tensor, J: torch.Tensor, window_size: int = 9) -> torch.Tensor:
         """
-        局部归一化互相关损失
+        每个批次、通道内的全局归一化互相关损失。
 
         Args:
             I: 图像1
             J: 图像2
-            window_size: 局部窗口大小
+            window_size: 旧接口参数；当前计算全局 NCC，不使用局部窗口
 
         Returns:
             torch.Tensor: NCC 损失 (1 - NCC)
         """
-        # 计算局部均值和标准差
-        device = I.device
-        channels = I.shape[1] if I.dim() == 5 else 1
-
-        # 简化版 NCC
-        I_mean = I.mean()
-        J_mean = J.mean()
-        I_std = I.std()
-        J_std = J.std()
-
-        ncc = ((I - I_mean) * (J - J_mean)).mean() / (I_std * J_std + 1e-8)
-        return 1 - ncc
+        if I.dim() < 3 or I.shape != J.shape:
+            raise ValueError("NCC inputs must have matching [B, C, spatial...] shapes")
+        dims = tuple(range(2, I.dim()))
+        centered_i = I - I.mean(dim=dims, keepdim=True)
+        centered_j = J - J.mean(dim=dims, keepdim=True)
+        covariance = (centered_i * centered_j).mean(dim=dims)
+        variance_i = centered_i.square().mean(dim=dims)
+        variance_j = centered_j.square().mean(dim=dims)
+        ncc = covariance / torch.sqrt(variance_i * variance_j + 1e-12)
+        return 1 - ncc.mean()
 
     def _nmi_loss(self, I: torch.Tensor, J: torch.Tensor, bins: int = 32) -> torch.Tensor:
         """
-        归一化互信息损失
+        未实现的归一化互信息损失；显式抛错以防误用。
 
         Args:
             I: 图像1
@@ -144,23 +161,13 @@ class LossBuilder:
         Returns:
             torch.Tensor: NMI 损失 (1 - NMI)
         """
-        # 简化版：使用互相关作为代理
-        I_flat = I.flatten()
-        J_flat = J.flatten()
-
-        # 计算互信息近似
-        mi = (I_flat * J_flat).mean() - I_flat.mean() * J_flat.mean()
-        nmi = mi / (I_flat.std() * J_flat.std() + 1e-8)
-
-        return 1 - nmi
+        raise NotImplementedError("Normalized mutual information loss is not implemented")
 
     def _impact_loss(
         self, features_warped: torch.Tensor, features_fixed: torch.Tensor
     ) -> torch.Tensor:
         """
-        IMPACT 语义损失
-
-        基于 DINOv2 特征的语义感知配准损失
+        未实现的 IMPACT 语义损失；显式抛错以防误用。
 
         Args:
             features_warped: 变形图像的语义特征
@@ -169,9 +176,7 @@ class LossBuilder:
         Returns:
             torch.Tensor: IMPACT 损失
         """
-        # 余弦相似度损失
-        cos_sim = F.cosine_similarity(features_warped, features_fixed, dim=-1)
-        return 1 - cos_sim.mean()
+        raise NotImplementedError("IMPACT semantic loss is not implemented")
 
     def _tv_regularization(self, phi: torch.Tensor) -> torch.Tensor:
         """
@@ -183,22 +188,8 @@ class LossBuilder:
         Returns:
             torch.Tensor: TV 正则化值
         """
-        if phi.dim() == 4:  # 2D [B, 2, H, W]
-            dx = phi[:, :, 1:, :] - phi[:, :, :-1, :]
-            dy = phi[:, :, :, 1:] - phi[:, :, :, :-1]
-            tv = torch.mean(torch.sqrt(dx * dx + 1e-8)) + torch.mean(
-                torch.sqrt(dy * dy + 1e-8)
-            )
-        else:  # 3D [B, 3, D, H, W]
-            dx = phi[:, :, 1:, :, :] - phi[:, :, :-1, :, :]
-            dy = phi[:, :, :, 1:, :] - phi[:, :, :, :-1, :]
-            dz = phi[:, :, :, :, 1:] - phi[:, :, :, :, :-1]
-            tv = (
-                torch.mean(torch.sqrt(dx * dx + 1e-8))
-                + torch.mean(torch.sqrt(dy * dy + 1e-8))
-                + torch.mean(torch.sqrt(dz * dz + 1e-8))
-            )
-        return tv
+        self._validate_displacement(phi)
+        return sum(torch.diff(phi, dim=axis).abs().mean() for axis in range(2, phi.dim()))
 
     def _jacobian_regularization(self, phi: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
         """
@@ -213,41 +204,30 @@ class LossBuilder:
         Returns:
             torch.Tensor: Jacobian 正则化值
         """
-        # 计算变形场的 Jacobian
-        if phi.dim() == 4:  # 2D
-            # 简化的 2D Jacobian 计算
-            dx_dx = self._gradient(phi[:, 0:1, :, :], dim=2)
-            dx_dy = self._gradient(phi[:, 0:1, :, :], dim=3)
-            dy_dx = self._gradient(phi[:, 1:2, :, :], dim=2)
-            dy_dy = self._gradient(phi[:, 1:2, :, :], dim=3)
-            det = dx_dx * dy_dy - dx_dy * dy_dx
-        else:  # 3D
-            # 简化的 3D Jacobian 计算
-            phi = phi.permute(0, 2, 3, 4, 1)  # [B, D, H, W, 3]
-            dphi_dx = self._gradient_3d(phi, dim=0)
-            dphi_dy = self._gradient_3d(phi, dim=1)
-            dphi_dz = self._gradient_3d(phi, dim=2)
-            jac = torch.stack([dphi_dx, dphi_dy, dphi_dz], dim=-1)
-            det = torch.det(jac + torch.eye(3, device=phi.device) * (1 - eps))
-
-        # 惩罚负值和接近零的值
-        det_positive = torch.clamp(det, min=eps)
-        reg = torch.mean(1.0 / det_positive) + torch.mean(F.relu(-det + eps))
-
-        return reg
-
-    def _gradient(self, x: torch.Tensor, dim: int) -> torch.Tensor:
-        """计算一阶差分"""
-        if dim == 2:
-            return x[:, :, 1:, :] - x[:, :, :-1, :]
+        self._validate_displacement(phi)
+        # Fields are voxel displacements in channel order x=W, y=H, z=D.
+        # All forward differences share the same lower-corner grid.
+        if phi.dim() == 4:
+            base = phi[:, :, :-1, :-1]
+            dx = phi[:, :, :-1, 1:] - base
+            dy = phi[:, :, 1:, :-1] - base
+            det = (1 + dx[:, 0]) * (1 + dy[:, 1]) - dy[:, 0] * dx[:, 1]
         else:
-            return x[:, :, :, 1:] - x[:, :, :, :-1]
+            base = phi[:, :, :-1, :-1, :-1]
+            dx = phi[:, :, :-1, :-1, 1:] - base
+            dy = phi[:, :, :-1, 1:, :-1] - base
+            dz = phi[:, :, 1:, :-1, :-1] - base
+            a, b, c = 1 + dx[:, 0], dy[:, 0], dz[:, 0]
+            d, e, f = dx[:, 1], 1 + dy[:, 1], dz[:, 1]
+            g, h, i = dx[:, 2], dy[:, 2], 1 + dz[:, 2]
+            det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+        return F.relu(eps - det).mean()
 
-    def _gradient_3d(self, x: torch.Tensor, dim: int) -> torch.Tensor:
-        """计算 3D 张量的一阶差分"""
-        if dim == 0:
-            return x[1:, :, :, :] - x[:-1, :, :, :]
-        elif dim == 1:
-            return x[:, 1:, :, :] - x[:, :-1, :, :]
-        else:
-            return x[:, :, 1:, :] - x[:, :, :-1, :]
+    @staticmethod
+    def _validate_displacement(phi: torch.Tensor) -> None:
+        if phi.dim() not in (4, 5) or phi.shape[1] != phi.dim() - 2:
+            raise ValueError("Expected voxel displacement [B, 2, H, W] or [B, 3, D, H, W]")
+        if not phi.is_floating_point() or any(size < 2 for size in phi.shape[2:]):
+            raise ValueError("Displacement must be floating point with each spatial dimension >= 2")
+        if not torch.isfinite(phi).all():
+            raise ValueError("Displacement contains NaN or Inf")

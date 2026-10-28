@@ -1,72 +1,26 @@
-# 跨模态 CT-MR 图像配准挑战赛配置文件
-# Competition Configuration File
+# One-pass convex_3d registration diagnostics. There are no learned weights.
+# Usage: python experiments/train_competition.py --config configs/competition_config.yaml --data Datasets --output outputs/NEW_RUN
+# An optional --val ROOT requires a separate ROOT/val directory and disjoint cases.
+model: convex_3d
 
-model: "convex_3d"  # 目前仅支持 convex_3d（逐图优化，无可学习参数）
-
-# 数据配置
 data:
-  # 训练数据根目录（相对仓库根目录，或填绝对路径）
-  # 配对训练数据位于 Datasets/train/（001-024）
-  train_dir: "Datasets/train"
-  # 验证数据根目录（本仓库未提供独立 val/，代码会自动回退到 train/）
-  val_dir: "Datasets/train"
-  # 测试数据根目录（025-032）
-  test_dir: "Datasets/test"
-  # 目标尺寸 [D, H, W]
-  target_size: [128, 128, 128]
+  target_size: [128, 128, 128]  # D, H, W on the optimization grid
 
-# 训练配置
 training:
+  num_epochs: 1  # diagnostics pass, not network training
   batch_size: 1
-  num_epochs: 50
-  learning_rate: 1e-4
-  weight_decay: 1e-5
-  seed: 42
   num_workers: 0
-  save_interval: 10
-  max_grad_norm: 5.0
-  use_scheduler: true
+  seed: 42
+  use_scheduler: false
 
-# 配准优化器参数（Simple3DRegistration）
 registration:
-  max_iter: 200
+  max_iter: 100
   lr: 0.1
   tv_weight: 0.01
-  similarity: "mse"
+  similarity: mse
 
-# 损失函数配置
-losses:
-  types: ["mse", "ncc"]
-  weights:
-    mse: 1.0
-    ncc: 1.0
-
-# 正则化权重
-regularization:
-  tv_weight: 0.05     # 全变差正则化
-  jacobian_weight: 0.01  # Jacobian 行列式正则化（防止折叠）
-
-# 数据增强
+# Augmentations are disabled: this runner does not learn network parameters.
 augmentation:
-  elastic_deform: true
-  elastic_deform_p: 0.3
-  random_flip: true
-  flip_p: 0.5
-  intensity_aug: true
-  intensity_p: 0.5
-  noise_std: 0.05
-  brightness_range: 0.1
-  contrast_range: 0.1
-
-# 评估配置
-evaluation:
-  organs: ["liver", "spleen", "kidney"]
-  dsc30_percent: 0.3
-  save_vis: true
-  max_vis: 20
-
-# 输出配置
-output:
-  base_dir: "competition_outputs"
-  save_warped: true
-  save_deformation_field: true
+  elastic_deform: false
+  random_flip: false
+  intensity_aug: false

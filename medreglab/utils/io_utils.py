@@ -36,14 +36,10 @@ def load_image(
     # 读取 SimpleITK 图像
     sitk_img = sitk.ReadImage(str(path))
 
-    # 转换为 numpy
-    arr = sitk.GetArrayFromImage(sitk_img)  # [D, H, W] 或 [H, W]
-
-    # 转换为 PyTorch 张量
-    if arr.ndim == 2:
-        tensor = torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0)
-    else:
-        tensor = torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0)
+    if sitk_img.GetDimension() not in (2, 3) or sitk_img.GetNumberOfComponentsPerPixel() != 1:
+        raise ValueError("load_image requires a scalar 2D/3D image; use load_deformation_field for vector fields")
+    arr = sitk.GetArrayFromImage(sitk_img)  # [D, H, W] or [H, W]
+    tensor = torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0)
 
     if return_sitk:
         return tensor, sitk_img
@@ -69,28 +65,28 @@ def save_image(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 转换为 numpy
+    # Scalar images only. Remove only known batch/channel axes; indiscriminate
+    # squeeze would destroy a legitimate singleton spatial dimension.
     if isinstance(data, torch.Tensor):
-        arr = data.squeeze().cpu().numpy()
+        arr = data.detach().cpu().numpy()
     elif isinstance(data, sitk.Image):
-        arr = sitk.GetArrayFromImage(data)
-        # 如果提供参考图像，直接保存
-        if reference is None:
-            sitk.WriteImage(data, str(path))
-            return
+        if data.GetDimension() not in (2, 3) or data.GetNumberOfComponentsPerPixel() != 1:
+            raise ValueError("save_image requires a scalar 2D/3D image")
+        sitk_img = sitk.Image(data)
+        if reference is not None:
+            sitk_img.CopyInformation(reference)
+        arr = None
     else:
-        arr = data
+        arr = np.asarray(data)
 
-    # 创建 SimpleITK 图像
-    if reference is not None:
-        sitk_img = sitk.GetImageFromArray(arr)
-        sitk_img.CopyInformation(reference)
-    else:
-        # 默认设置
-        sitk_img = sitk.GetImageFromArray(arr)
-        sitk_img.SetSpacing((1.0,) * arr.ndim)
-        sitk_img.SetOrigin((0.0,) * arr.ndim)
-        sitk_img.SetDirection(sitk.GetIdentityDirection(arr.ndim))
+    if arr is not None:
+        if arr.ndim in (4, 5) and arr.shape[:2] == (1, 1):
+            arr = arr[0, 0]
+        if arr.ndim not in (2, 3):
+            raise ValueError("save_image requires [H,W], [D,H,W], [1,1,H,W], or [1,1,D,H,W]")
+        sitk_img = sitk.GetImageFromArray(arr, isVector=False)
+        if reference is not None:
+            sitk_img.CopyInformation(reference)
 
     # 保存
     sitk.WriteImage(sitk_img, str(path))
@@ -102,9 +98,16 @@ def save_image(
             json.dump(metadata, f, indent=2)
 
 
-def load_deformation_field(path: Union[str, Path]) -> torch.Tensor:
+def load_deformation_field(
+    path: Union[str, Path], return_sitk: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, sitk.Image]]:
     """
-    加载变形场
+    Load a SimpleITK physical displacement vector field.
+
+    Returns [1, 2, H, W] or [1, 3, D, H, W]. Components are physical
+    LPS x/y[/z] displacement in millimetres, not voxel-index units. Spatial
+    dimensions follow SimpleITK's NumPy order; with return_sitk=True the
+    original image is returned as well, preserving reference geometry.
 
     Args:
         path: 变形场路径
@@ -112,13 +115,20 @@ def load_deformation_field(path: Union[str, Path]) -> torch.Tensor:
     Returns:
         变形场张量
     """
-    tensor, sitk_img = load_image(path, return_sitk=True)
-
-    # 确保维度正确 [D, H, W] 或 [2, H, W]
-    if tensor.dim() == 4:
-        tensor = tensor.squeeze(0)  # [C, H, W]
-
-    return tensor
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Displacement field not found: {path}")
+    sitk_img = sitk.ReadImage(str(path))
+    dimension = sitk_img.GetDimension()
+    if dimension not in (2, 3) or sitk_img.GetNumberOfComponentsPerPixel() != dimension:
+        raise ValueError("Expected a 2D/3D vector image with one component per spatial dimension")
+    arr = sitk.GetArrayFromImage(sitk_img)
+    if arr.dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("Displacement vector field must be float32 or float64")
+    if not np.isfinite(arr).all():
+        raise ValueError("Displacement vector field contains NaN or Inf")
+    tensor = torch.from_numpy(np.ascontiguousarray(np.moveaxis(arr, -1, 0))).unsqueeze(0)
+    return (tensor, sitk_img) if return_sitk else tensor
 
 
 def save_deformation_field(
@@ -127,14 +137,35 @@ def save_deformation_field(
     reference: Optional[sitk.Image] = None,
 ) -> None:
     """
-    保存变形场
+    Save a physical LPS x/y[/z] displacement in millimetres as a vector image.
+
+    Accepted shapes are [2,H,W], [3,D,H,W], [1,2,H,W], or [1,3,D,H,W].
+    A reference supplies the physical geometry and must match the spatial size.
+    This helper does not convert voxel-index displacement into millimetres.
 
     Args:
         field: 变形场张量
         path: 保存路径
         reference: 参考图像
     """
-    save_image(field, path, reference=reference)
+    arr = field.detach().cpu().numpy() if isinstance(field, torch.Tensor) else np.asarray(field)
+    if arr.ndim in (4, 5) and arr.shape[0] == 1 and arr.shape[1] in (2, 3) and arr.ndim == arr.shape[1] + 2:
+        arr = arr[0]
+    if arr.ndim not in (3, 4) or arr.shape[0] not in (2, 3) or arr.ndim != arr.shape[0] + 1:
+        raise ValueError("Expected channel-first [2,H,W], [3,D,H,W], or a single-item batch")
+    if arr.dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("Displacement vector field must be float32 or float64")
+    if not np.isfinite(arr).all():
+        raise ValueError("Displacement vector field contains NaN or Inf")
+    array_vector = np.ascontiguousarray(np.moveaxis(arr, 0, -1))
+    image = sitk.GetImageFromArray(array_vector, isVector=True)
+    if reference is not None:
+        if reference.GetDimension() != arr.shape[0] or tuple(reference.GetSize()) != tuple(arr.shape[1:][::-1]):
+            raise ValueError("Displacement grid does not match reference spatial size")
+        image.CopyInformation(reference)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(image, str(path))
 
 
 def load_batch(
@@ -167,7 +198,9 @@ def load_batch(
             }
             metadata.append(meta)
 
-    batch = torch.stack(images, dim=0)
+    if not images:
+        raise ValueError("paths must contain at least one image")
+    batch = torch.cat(images, dim=0)
 
     if return_metadata:
         return batch, metadata
@@ -193,10 +226,12 @@ def resample_image(
     """
     original_spacing = image.GetSpacing()
     original_size = image.GetSize()
+    if len(target_spacing) != image.GetDimension() or any(not np.isfinite(x) or x <= 0 for x in target_spacing):
+        raise ValueError("target_spacing must contain one finite positive value per spatial dimension")
 
     # 计算新的尺寸
     new_size = [
-        int(round(osz * osp / tsp))
+        max(1, int(round(osz * osp / tsp)))
         for osz, osp, tsp in zip(original_size, original_spacing, target_spacing)
     ]
 
@@ -207,7 +242,7 @@ def resample_image(
     resampler.SetOutputDirection(image.GetDirection())
     resampler.SetOutputOrigin(image.GetOrigin())
     resampler.SetTransform(sitk.Transform())
-    resampler.SetDefaultPixelValue(image.GetPixelIDValue())
+    resampler.SetDefaultPixelValue(0.0)
     resampler.SetInterpolator(interpolator)
 
     return resampler.Execute(image)
@@ -230,18 +265,39 @@ def normalize_image(
         归一化后的图像
     """
     if isinstance(image, sitk.Image):
+        if image.GetNumberOfComponentsPerPixel() != 1:
+            raise ValueError("normalize_image requires a scalar image")
         arr = sitk.GetArrayFromImage(image)
         normalized = normalize_image(arr, method, target_range)
-        result = sitk.GetImageFromArray(normalized)
+        result = sitk.GetImageFromArray(normalized, isVector=False)
         result.CopyInformation(image)
         return result
 
     if isinstance(image, torch.Tensor):
-        arr = image.squeeze().cpu().numpy()
-        normalized = normalize_image(arr, method, target_range)
-        return torch.from_numpy(normalized).float().unsqueeze(0).unsqueeze(0)
+        value = image.float()
+        if value.numel() == 0:
+            raise ValueError("Cannot normalize an empty image")
+        if method == "minmax":
+            lower, upper = value.min(), value.max()
+            normalized = (value - lower) / (upper - lower) if upper > lower else value - lower
+        elif method == "zscore":
+            mean, std = value.mean(), value.std(unbiased=False)
+            normalized = (value - mean) / std if std > 0 else value - mean
+        elif method == "percentile":
+            lower = torch.quantile(value.flatten(), 0.01)
+            upper = torch.quantile(value.flatten(), 0.99)
+            clipped = value.clamp(lower, upper)
+            normalized = (clipped - lower) / (upper - lower) if upper > lower else clipped - lower
+        else:
+            raise ValueError(f"Unknown normalization method: {method}")
+        if target_range != (0, 1):
+            normalized = normalized * (target_range[1] - target_range[0]) + target_range[0]
+        return normalized
 
     # numpy 处理
+    arr = np.asarray(image, dtype=np.float64)
+    if arr.size == 0:
+        raise ValueError("Cannot normalize an empty image")
     if method == "minmax":
         min_val = arr.min()
         max_val = arr.max()

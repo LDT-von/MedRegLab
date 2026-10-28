@@ -9,6 +9,7 @@ from .dsc_evaluator import (
     submit_deformation_fields,
     dice_coefficient,
     dice_per_organ,
+    competition_case_dice,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "submit_deformation_fields",
     "dice_coefficient",
     "dice_per_organ",
+    "competition_case_dice",
 ]

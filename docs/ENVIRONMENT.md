@@ -2,20 +2,22 @@
 
 本文件记录本仓库在 `/data1/MedRegLab` 上的实际运行环境、已知坑和复现方式。
 
+> 本文第 2–10 节主要保留 2026-10-28 环境迁移和旧版自检记录，不代表后续修改已在 RTX 5090 上重新验证。当前命令以 [README.md](../README.md) 为准；早期 64³ 输出不能据此认定符合原始 CT 网格提交规范。
+
 ---
 
 ## 1. 快速开始
 
 ```bash
-source /data1/MedRegLab/activate_env.sh   # 激活 .venv
 cd /data1/MedRegLab
-python -m pytest tests/ -q                 # 6 passed
+source scripts/activate_medreg_env.sh
+python -m pytest tests/ -q
 ```
 
-从零重建环境：
+仅当目标 .venv 不存在且需要从零创建时：
 
 ```bash
-bash /data1/MedRegLab/setup_env.sh
+bash scripts/setup_medreg_env.sh
 ```
 
 ---
@@ -342,7 +344,7 @@ git 远端 `https://github.com/LDT-von/MedRegLab.git` 保留了初始提交 `67b
 
 **注意**：`convex_3d`（`Simple3DRegistration`）**没有可学习参数**，
 它是逐图优化（Adam on `phi`）。因此 `train_competition.py` 在该模型下
-只做「配准 + 评估」，不做梯度更新，也不会保存 checkpoint——
+只做「配准 + 评估」，不会更新网络参数或保存 checkpoint；逐例位移场仍会通过梯度优化更新——
 这是预期行为，不是错误。
 
 ---

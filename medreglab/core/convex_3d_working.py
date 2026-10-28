@@ -9,18 +9,16 @@ Simple 3D registration - 极简版，使用 autograd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
-import numpy as np
+from typing import Optional, Dict, Any
+from numbers import Integral
+import math
 
 
 class Simple3DRegistration(nn.Module):
     """
     简单可靠的 3D 配准 - 基于 Adam + MSE + TV
 
-    特点：
-    - 100% 工作
-    - 无外部依赖问题
-    - 适合跨模态 CT-MR 配准
+    对每对输入直接优化采样位移场；不包含可训练的网络权重。
     """
 
     def __init__(
@@ -35,13 +33,25 @@ class Simple3DRegistration(nn.Module):
         self.lr = lr
         self.tv_weight = tv_weight
         self.similarity = similarity
+        self._validate_parameters()
+
+    def _validate_parameters(self):
+        # These attributes may also be changed by a CLI after construction.
+        if isinstance(self.max_iter, bool) or not isinstance(self.max_iter, Integral) or self.max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
+        if not math.isfinite(self.lr) or self.lr <= 0:
+            raise ValueError("lr must be finite and positive")
+        if not math.isfinite(self.tv_weight) or self.tv_weight < 0:
+            raise ValueError("tv_weight must be finite and non-negative")
+        if self.similarity not in ("mse", "ncc"):
+            raise ValueError("similarity must be 'mse' or 'ncc'")
 
     def forward(
         self,
         moving: torch.Tensor,
         fixed: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """
         Args:
             moving: [B, C, D, H, W] (任意 B, C 通常为 1)
@@ -49,65 +59,105 @@ class Simple3DRegistration(nn.Module):
             mask: [B, 1, D, H, W] or None
 
         Returns:
-            dict: phi, phi_inv, warped, loss, loss_history
+            dict: phi, phi_inv, warped, loss, loss_history. ``phi_inv`` is
+            None: the inverse of a spatially varying field is not -phi and
+            may not exist at all when the deformation folds.
         """
+        self._validate_parameters()
+        if torch.is_inference_mode_enabled():
+            raise RuntimeError("Registration needs internal gradients; use torch.no_grad(), not torch.inference_mode()")
+        if moving.ndim != 5 or fixed.ndim != 5:
+            raise ValueError("moving and fixed must have shape [B, C, D, H, W]")
+        if moving.shape != fixed.shape:
+            raise ValueError("moving and fixed must have identical shapes")
+        if moving.device != fixed.device:
+            raise ValueError("moving and fixed must be on the same device")
         B, C, D, H, W = moving.shape
+        if B < 1 or C < 1 or min(D, H, W) < 2:
+            raise ValueError("batch/channels must be non-empty and every spatial dimension must be >= 2")
         device = moving.device
-        # 强制 float32 避免 double/float 不匹配
-        moving = moving.float()
-        fixed = fixed.float()
+        # Inputs are data, not learnable parameters of this per-case optimizer.
+        moving = moving.detach().float()
+        fixed = fixed.detach().float()
+        if not torch.isfinite(moving).all() or not torch.isfinite(fixed).all():
+            raise ValueError("moving and fixed must contain only finite values")
+        if mask is not None:
+            if mask.device != device or mask.ndim != 5:
+                raise ValueError("mask must be a 5D tensor on the input device")
+            if mask.shape[0] != B or mask.shape[1] not in (1, C) or mask.shape[2:] != (D, H, W):
+                raise ValueError("mask must have shape [B, 1 or C, D, H, W]")
+            mask = mask.detach().float()
+            if not torch.isfinite(mask).all() or (mask < 0).any():
+                raise ValueError("mask weights must be finite and non-negative")
+            if (mask.sum(dim=(1, 2, 3, 4)) <= 0).any():
+                raise ValueError("each sample mask must contain positive weight")
         dtype = moving.dtype
 
-        # 初始化可学习位移场
-        phi = torch.zeros(B, 3, D, H, W, device=device, dtype=dtype, requires_grad=True)
-        optimizer = torch.optim.Adam([phi], lr=self.lr)
+        # The optimizer needs autograd even when its caller uses no_grad().
+        with torch.enable_grad():
+            phi = torch.zeros(B, 3, D, H, W, device=device, dtype=dtype, requires_grad=True)
+            optimizer = torch.optim.Adam([phi], lr=self.lr)
+            loss_history = []
+            best_phi = phi.detach().clone()
+            best_loss = float("inf")
 
-        loss_history = []
-        best_phi = phi.detach().clone()
-        best_loss = float("inf")
+            for it in range(self.max_iter):
+                warped = self._warp(moving, phi)
+                total_loss = self._objective(warped, fixed, phi, mask)
+                loss_val = total_loss.item()
+                if not math.isfinite(loss_val):
+                    raise FloatingPointError(f"Non-finite registration loss at iteration {it}")
+                loss_history.append(loss_val)
+                # Capture the exact field used to compute this loss, before the
+                # optimizer mutates it. The previous code saved the next field.
+                if loss_val < best_loss:
+                    best_loss = loss_val
+                    best_phi = phi.detach().clone()
 
-        for it in range(self.max_iter):
-            warped = self._warp(moving, phi)
+                optimizer.zero_grad()
+                total_loss.backward()
+                if phi.grad is None or not torch.isfinite(phi.grad).all():
+                    raise FloatingPointError(f"Non-finite registration gradient at iteration {it}")
+                optimizer.step()
 
-            # 相似性损失
-            if self.similarity == "mse":
-                if mask is not None:
-                    sim_loss = ((warped - fixed) ** 2 * mask).mean()
-                else:
-                    sim_loss = F.mse_loss(warped, fixed)
-            else:  # ncc
-                sim_loss = 1 - self._ncc(warped, fixed, mask)
+                if it > 5 and abs(loss_history[-2] - loss_val) < 1e-6:
+                    break
 
-            # TV 正则化
-            tv_loss = self._tv(phi)
-            total_loss = sim_loss + self.tv_weight * tv_loss
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-
-            loss_val = total_loss.item()
-            loss_history.append(loss_val)
-
-            if loss_val < best_loss:
-                best_loss = loss_val
+        # The final update has not yet been evaluated in the loop. Include it
+        # as a candidate so max_iter=1 can return the first optimized field.
+        with torch.no_grad():
+            if not torch.isfinite(phi).all():
+                raise FloatingPointError("Non-finite final registration field")
+            final_warped = self._warp(moving, phi)
+            final_loss = self._objective(final_warped, fixed, phi, mask).item()
+            if not math.isfinite(final_loss):
+                raise FloatingPointError("Non-finite final registration loss")
+            if final_loss < best_loss:
+                best_loss = final_loss
                 best_phi = phi.detach().clone()
-
-            # 早停
-            if it > 5 and abs(loss_history[-2] - loss_val) < 1e-6:
-                break
-
-        # 使用最后的 phi
-        phi_final = best_phi
-        warped = self._warp(moving, phi_final)
+            phi_final = best_phi
+            warped = self._warp(moving, phi_final)
 
         return {
             "phi": phi_final,
-            "phi_inv": -phi_final,
+            "phi_inv": None,
             "warped": warped,
             "loss": best_loss,
             "loss_history": loss_history,
         }
+
+    def _objective(self, warped, fixed, phi, mask):
+        if self.similarity == "mse":
+            if mask is not None:
+                weights = mask.expand_as(warped)
+                axes = (1, 2, 3, 4)
+                weighted_error = ((warped - fixed).square() * weights).sum(dim=axes)
+                similarity_loss = (weighted_error / weights.sum(dim=axes)).mean()
+            else:
+                similarity_loss = F.mse_loss(warped, fixed)
+        else:
+            similarity_loss = 1 - self._ncc(warped, fixed, mask)
+        return similarity_loss + self.tv_weight * self._tv(phi)
 
     def _warp(self, image: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
         """3D 形变"""
@@ -151,24 +201,27 @@ class Simple3DRegistration(nn.Module):
         J: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """全局 NCC"""
+        """Per-sample global NCC; channel and mask weights are counted once."""
+        axes = (1, 2, 3, 4)
         if mask is not None:
-            I_f = I * mask
-            J_f = J * mask
-            mean_I = I_f.sum() / (mask.sum() + 1e-8)
-            mean_J = J_f.sum() / (mask.sum() + 1e-8)
-            I_c = (I - mean_I) * mask
-            J_c = (J - mean_J) * mask
-            num = (I_c * J_c).sum()
-            denom = torch.sqrt((I_c ** 2).sum() * (J_c ** 2).sum() + 1e-8)
+            weights = mask.expand_as(I)
+            weight_sum = weights.sum(dim=axes, keepdim=True)
+            mean_I = (I * weights).sum(dim=axes, keepdim=True) / weight_sum
+            mean_J = (J * weights).sum(dim=axes, keepdim=True) / weight_sum
+            I_c, J_c = I - mean_I, J - mean_J
+            num = (I_c * J_c * weights).sum(dim=axes)
+            variance_I = (I_c.square() * weights).sum(dim=axes)
+            variance_J = (J_c.square() * weights).sum(dim=axes)
         else:
-            mean_I = I.mean()
-            mean_J = J.mean()
+            mean_I = I.mean(dim=axes, keepdim=True)
+            mean_J = J.mean(dim=axes, keepdim=True)
             I_c = I - mean_I
             J_c = J - mean_J
-            num = (I_c * J_c).sum()
-            denom = torch.sqrt((I_c ** 2).sum() * (J_c ** 2).sum() + 1e-8)
-        return num / (denom + 1e-8)
+            num = (I_c * J_c).sum(dim=axes)
+            variance_I = I_c.square().sum(dim=axes)
+            variance_J = J_c.square().sum(dim=axes)
+        denom = torch.sqrt(variance_I * variance_J + 1e-8)
+        return (num / (denom + 1e-8)).mean()
 
 
 def register_3d_simple(

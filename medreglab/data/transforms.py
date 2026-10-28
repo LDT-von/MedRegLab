@@ -6,10 +6,59 @@ Data Transforms - 医学图像数据增强与预处理
 
 import torch
 import torch.nn.functional as F
-import numpy as np
-import SimpleITK as sitk
-from typing import Optional, Tuple, List, Callable, Dict, Any, Union
+from typing import Optional, Tuple, List, Callable, Dict, Any
 import random
+import math
+
+
+def _spatial_tensors(sample):
+    """List aligned images and mask dictionaries; reject ambiguous batches."""
+    images = []
+    for key in ("fixed", "moving", "image"):
+        if key in sample:
+            tensor = sample[key]
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 5:
+                raise ValueError(f"{key} must be a tensor shaped [B,C,D,H,W]")
+            if not tensor.is_floating_point():
+                raise ValueError(f"{key} must have a floating-point image dtype")
+            images.append((sample, key, tensor))
+    masks = []
+    if not images:
+        if any(sample.get(key) is not None for key in ("seg_fixed", "seg_moving", "seg", "segmentations")):
+            raise ValueError("Masks require a matching spatial image")
+        return images, masks
+    reference = images[0][2]
+    for _, key, tensor in images:
+        if tensor.shape[0] != reference.shape[0] or tensor.shape[-3:] != reference.shape[-3:]:
+            raise ValueError(f"{key} has a different batch or spatial shape")
+        if tensor.device != reference.device:
+            raise ValueError("All paired images must use the same device")
+    seen = set()
+    for group, image_key in (("seg_fixed", "fixed"), ("seg_moving", "moving"),
+                             ("seg", "image"), ("segmentations", None)):
+        entries = sample.get(group)
+        if entries is None:
+            continue
+        if image_key is not None and image_key not in sample:
+            raise ValueError(f"{group} requires matching {image_key} image")
+        if not isinstance(entries, dict):
+            raise ValueError(f"{group} must be an organ-to-mask dictionary")
+        for organ, tensor in entries.items():
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim not in (3, 4, 5):
+                raise ValueError(f"{group}[{organ}] must have 3, 4 or 5 dimensions")
+            if tensor.shape[-3:] != reference.shape[-3:]:
+                raise ValueError(f"{group}[{organ}] has a different spatial shape")
+            if image_key is not None and tensor.device != sample[image_key].device:
+                raise ValueError(f"{group}[{organ}] and {image_key} must use the same device")
+            if (tensor.ndim == 5 and tensor.shape[0] != reference.shape[0]) or (
+                tensor.ndim < 5 and reference.shape[0] != 1
+            ):
+                raise ValueError(f"{group}[{organ}] has an ambiguous or mismatched batch")
+            identity = (id(entries), organ)
+            if identity not in seen:
+                masks.append((entries, organ, tensor))
+                seen.add(identity)
+    return images, masks
 
 
 class MedicalImageTransform:
@@ -28,30 +77,28 @@ class RandomFlip3D(MedicalImageTransform):
     沿指定轴随机翻转图像
     """
 
-    def __init__(self, axes: List[int] = [0, 1, 2], p: float = 0.5):
+    def __init__(self, axes: List[int] = None, p: float = 0.5):
         """
         Args:
             axes: 要翻转的轴列表 [0=D, 1=H, 2=W]
             p: 翻转概率
         """
-        self.axes = axes
+        self.axes = [0, 1, 2] if axes is None else list(axes)
+        if any(axis not in (0, 1, 2) for axis in self.axes) or len(set(self.axes)) != len(self.axes):
+            raise ValueError("Flip axes must be distinct values from 0, 1, 2")
+        if not 0 <= p <= 1:
+            raise ValueError("Probability must be in [0, 1]")
         self.p = p
 
     def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         for axis in self.axes:
             if random.random() < self.p:
-                # 翻转图像
-                if "fixed" in sample and isinstance(sample["fixed"], torch.Tensor):
-                    sample["fixed"] = torch.flip(sample["fixed"], dims=[axis + 2])
-                if "moving" in sample and isinstance(sample["moving"], torch.Tensor):
-                    sample["moving"] = torch.flip(sample["moving"], dims=[axis + 2])
-                # 翻转分割标签
-                if "segmentations" in sample:
-                    for organ in sample["segmentations"]:
-                        seg = sample["segmentations"][organ]
-                        sample["segmentations"][organ] = torch.flip(seg, dims=[axis + 1])
+                images, masks = _spatial_tensors(sample)
+                for owner, name, tensor in images + masks:
+                    owner[name] = torch.flip(tensor, dims=[tensor.ndim - 3 + axis])
                 # 记录翻转
                 sample[f"flipped_axis_{axis}"] = True
+                sample["spatial_augmented"] = True
         return sample
 
 
@@ -63,22 +110,18 @@ class RandomRotate90(MedicalImageTransform):
     """
 
     def __init__(self, p: float = 0.5):
+        if not 0 <= p <= 1:
+            raise ValueError("Probability must be in [0, 1]")
         self.p = p
 
     def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         if random.random() < self.p:
             k = random.choice([1, 2, 3])  # 90, 180, 270度
-            spatial_dims = [2, 3, 4]  # D, H, W
-
-            if "fixed" in sample and isinstance(sample["fixed"], torch.Tensor):
-                sample["fixed"] = torch.rot90(sample["fixed"], k, dims=[3, 4])
-            if "moving" in sample and isinstance(sample["moving"], torch.Tensor):
-                sample["moving"] = torch.rot90(sample["moving"], k, dims=[3, 4])
-            if "segmentations" in sample:
-                for organ in sample["segmentations"]:
-                    seg = sample["segmentations"][organ]
-                    sample["segmentations"][organ] = torch.rot90(seg, k, dims=[2, 3])
+            images, masks = _spatial_tensors(sample)
+            for owner, name, tensor in images + masks:
+                owner[name] = torch.rot90(tensor, k, dims=[-2, -1])
             sample["rotated_k"] = k
+            sample["spatial_augmented"] = True
         return sample
 
 
@@ -86,7 +129,7 @@ class RandomElasticDeformation(MedicalImageTransform):
     """
     随机弹性形变增强
 
-    使用B样条网格生成平滑的随机形变
+    通过控制点网格的三线性插值生成随机形变。
     """
 
     def __init__(
@@ -101,6 +144,8 @@ class RandomElasticDeformation(MedicalImageTransform):
             deform_std: 形变标准差（像素）
             p: 应用概率
         """
+        if not isinstance(num_ctrl_points, int) or num_ctrl_points < 2 or not math.isfinite(deform_std) or deform_std < 0 or not 0 <= p <= 1:
+            raise ValueError("Expected >=2 control points, nonnegative std and probability in [0, 1]")
         self.num_ctrl_points = num_ctrl_points
         self.deform_std = deform_std
         self.p = p
@@ -109,16 +154,18 @@ class RandomElasticDeformation(MedicalImageTransform):
         if random.random() > self.p:
             return sample
 
-        # 获取图像尺寸
-        if "moving" in sample and isinstance(sample["moving"], torch.Tensor):
-            shape = sample["moving"].shape[2:]  # D, H, W
-        elif "fixed" in sample and isinstance(sample["fixed"], torch.Tensor):
-            shape = sample["fixed"].shape[2:]
-        else:
+        images, masks = _spatial_tensors(sample)
+        if not images:
             return sample
+        reference = images[0][2]
+        shape = reference.shape[-3:]
 
         # 生成随机控制点位移
-        displacement = torch.randn(3, self.num_ctrl_points, self.num_ctrl_points, self.num_ctrl_points) * self.deform_std
+        dtype = reference.dtype if reference.dtype in (torch.float32, torch.float64) else torch.float32
+        displacement = torch.randn(
+            3, self.num_ctrl_points, self.num_ctrl_points, self.num_ctrl_points,
+            device=reference.device, dtype=dtype,
+        ) * self.deform_std
 
         # 上采样到目标尺寸
         displacement = F.interpolate(
@@ -129,21 +176,24 @@ class RandomElasticDeformation(MedicalImageTransform):
         ).squeeze(0)
 
         # 应用位移场
-        if "moving" in sample:
-            sample["moving"] = self._apply_displacement(sample["moving"], displacement)
-        if "fixed" in sample:
-            sample["fixed"] = self._apply_displacement(sample["fixed"], displacement)
-        if "segmentations" in sample:
-            for organ in sample["segmentations"]:
-                seg = sample["segmentations"][organ]
-                sample["segmentations"][organ] = self._apply_displacement(
-                    seg.unsqueeze(0), displacement
-                ).squeeze(0)
+        for owner, name, tensor in images:
+            owner[name] = self._apply_displacement(tensor, displacement, mode="bilinear")
+        for owner, name, tensor in masks:
+            input_ndim = tensor.ndim
+            if input_ndim == 3:
+                tensor = tensor.unsqueeze(0).unsqueeze(0)
+            elif input_ndim == 4:
+                tensor = tensor.unsqueeze(0)
+            warped = self._apply_displacement(tensor, displacement, mode="nearest")
+            owner[name] = warped.squeeze(0).squeeze(0) if input_ndim == 3 else (
+                warped.squeeze(0) if input_ndim == 4 else warped
+            )
+        sample["spatial_augmented"] = True
 
         return sample
 
     def _apply_displacement(
-        self, image: torch.Tensor, displacement: torch.Tensor
+        self, image: torch.Tensor, displacement: torch.Tensor, mode: str = "bilinear"
     ) -> torch.Tensor:
         """应用位移场到图像
 
@@ -151,37 +201,38 @@ class RandomElasticDeformation(MedicalImageTransform):
             image: [B, C, D, H, W]
             displacement: [3, D, H, W]，轴序 (x=W, y=H, z=D)
         """
+        if image.ndim != 5 or mode not in ("bilinear", "nearest"):
+            raise ValueError("Expected a 5D image and bilinear/nearest sampling")
         B, C, D, H, W = image.shape
+        if displacement.ndim == 4:
+            displacement = displacement.unsqueeze(0)
+        if displacement.ndim != 5 or displacement.shape[1:] != (3, D, H, W):
+            raise ValueError("Displacement must have shape [1|B,3,D,H,W]")
+        if displacement.shape[0] not in (1, B):
+            raise ValueError("Displacement batch must be one or match image batch")
+        original_dtype = image.dtype
+        work = image if image.dtype in (torch.float32, torch.float64) else image.float()
+        displacement = displacement.to(device=work.device, dtype=work.dtype).expand(B, -1, -1, -1, -1)
 
         # 基础网格：与 convex_3d_working.py 一致。
         # F.grid_sample 的 3D 约定是 grid 为 [B, D_out, H_out, W_out, 3]，
         # 最后一维为 (x, y, z)。
-        grid_d = torch.linspace(-1, 1, D, device=image.device)
-        grid_h = torch.linspace(-1, 1, H, device=image.device)
-        grid_w = torch.linspace(-1, 1, W, device=image.device)
+        grid_d = torch.linspace(-1, 1, D, device=work.device, dtype=work.dtype)
+        grid_h = torch.linspace(-1, 1, H, device=work.device, dtype=work.dtype)
+        grid_w = torch.linspace(-1, 1, W, device=work.device, dtype=work.dtype)
         grid_d, grid_h, grid_w = torch.meshgrid(
             grid_d, grid_h, grid_w, indexing="ij"
         )
         base_grid = torch.stack([grid_w, grid_h, grid_d], dim=-1)  # [D, H, W, 3]
 
         # 位移归一化到 [-1, 1]，并按 (x, y, z) 重排到网格最后一维
-        disp_norm = displacement.clone()
-        disp_norm[0] = 2 * disp_norm[0] / max(W - 1, 1)  # x -> W
-        disp_norm[1] = 2 * disp_norm[1] / max(H - 1, 1)  # y -> H
-        disp_norm[2] = 2 * disp_norm[2] / max(D - 1, 1)  # z -> D
-        # [3, D, H, W] -> [D, H, W, 3]
-        disp_norm = disp_norm.permute(1, 2, 3, 0)
-
-        warped_grid = (base_grid + disp_norm).unsqueeze(0)  # [1, D, H, W, 3]
-
-        # grid_sample 要求 grid 与 input dtype 一致
-        warped_grid = warped_grid.to(dtype=image.dtype)
+        scales = work.new_tensor([2 / max(W - 1, 1), 2 / max(H - 1, 1), 2 / max(D - 1, 1)])
+        disp_norm = displacement * scales.view(1, 3, 1, 1, 1)
+        warped_grid = base_grid.unsqueeze(0) + disp_norm.permute(0, 2, 3, 4, 1)
 
         # 采样
-        image = F.grid_sample(
-            image, warped_grid, mode="bilinear", padding_mode="border", align_corners=True
-        )
-        return image
+        warped = F.grid_sample(work, warped_grid, mode=mode, padding_mode="border", align_corners=True)
+        return warped.to(dtype=original_dtype)
 
 
 class RandomIntensityAugmentation(MedicalImageTransform):

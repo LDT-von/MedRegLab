@@ -10,13 +10,11 @@ DSC30 = 最低 30% 病例的 DSC 平均值（鲁棒性评分）
 """
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 import SimpleITK as sitk
 from pathlib import Path
-from typing import Union, List, Dict, Tuple, Optional, Any
+from typing import Union, List, Dict, Optional, Any
 import json
-import warnings
 
 
 def dice_coefficient(
@@ -28,9 +26,9 @@ def dice_coefficient(
     计算两组分割标签之间的 Dice 系数
 
     Args:
-        seg_a: 分割标签 A（体素集合）
-        seg_b: 分割标签 B（体素集合）
-        smooth: 平滑项防止除零
+        seg_a: 固定 CT 的二值器官 mask
+        seg_b: 已变形到 CT 空间的 MR 器官 mask
+        smooth: 仅为兼容旧接口保留；比赛公式不加入平滑项
 
     Returns:
         float: Dice 系数 [0, 1]
@@ -40,18 +38,32 @@ def dice_coefficient(
     if isinstance(seg_b, torch.Tensor):
         seg_b = seg_b.detach().cpu().numpy()
 
-    # 转为二值
-    seg_a = (seg_a > 0.5).astype(np.float32).flatten()
-    seg_b = (seg_b > 0.5).astype(np.float32).flatten()
+    seg_a = np.asarray(seg_a)
+    seg_b = np.asarray(seg_b)
+    if seg_a.shape != seg_b.shape:
+        raise ValueError(f"Dice mask shapes differ: {seg_a.shape} vs {seg_b.shape}")
+    if not np.isfinite(seg_a).all() or not np.isfinite(seg_b).all():
+        raise ValueError("Dice masks contain NaN or Inf")
+    fixed = seg_a > 0.5
+    warped = seg_b > 0.5
+    fixed_count = int(np.count_nonzero(fixed))
+    # Competition rule: if the fixed CT organ is absent, the score is 1.0,
+    # including when the warped MR contains a false-positive organ.
+    if fixed_count == 0:
+        return 1.0
+    warped_count = int(np.count_nonzero(warped))
+    return 2.0 * int(np.count_nonzero(fixed & warped)) / (fixed_count + warped_count)
 
-    intersection = np.sum(seg_a * seg_b)
-    union_sum = seg_a.sum() + seg_b.sum()
 
-    if union_sum < smooth:
-        return 0.0
-
-    dice = (2.0 * intersection + smooth) / (union_sum + smooth)
-    return float(dice)
+def competition_case_dice(fixed_masks, warped_masks):
+    """Calculate the exact competition per-organ and case mean Dice scores."""
+    organs = ("liver", "spleen", "kidney")
+    for organ in organs:
+        if organ not in fixed_masks or organ not in warped_masks:
+            raise ValueError(f"Both CT and warped MR masks are required for {organ}")
+    scores = {organ: dice_coefficient(fixed_masks[organ], warped_masks[organ]) for organ in organs}
+    scores["mean"] = sum(scores.values()) / len(organs)
+    return scores
 
 
 def dice_per_organ(
@@ -73,7 +85,7 @@ def dice_per_organ(
         if organ in warped_seg:
             organ_dice[organ] = dice_coefficient(fixed_seg[organ], warped_seg[organ])
         else:
-            organ_dice[organ] = 0.0
+            raise ValueError(f"Warped segmentation missing organ {organ!r}")
     return organ_dice
 
 
@@ -83,6 +95,7 @@ def compute_dsc_for_pair(
     deformation_field: sitk.Image,
     fixed_segmentations: Dict[str, str],
     organs: List[str] = None,
+    moving_segmentations: Optional[Dict[str, str]] = None,
 ) -> Dict[str, float]:
     """
     对一对图像计算 DSC
@@ -90,66 +103,46 @@ def compute_dsc_for_pair(
     Args:
         fixed_image: 固定图像 (CT)
         moving_image: 浮动图像 (MR)
-        deformation_field: 变形场 (displacement field，与 moving_image 相同空间)
-        fixed_segmentations: 固定图像各器官分割文件路径
+        deformation_field: 原始 CT 网格上的物理位移场（CT 点到 MR 点）
+        fixed_segmentations: CT 各器官二值分割文件路径或 SimpleITK 图像
+        moving_segmentations: MR 各器官二值分割文件路径或 SimpleITK 图像
         organs: 器官列表
 
     Returns:
         dict: {"liver": DSC, "spleen": DSC, "kidney": DSC, "mean": 平均DSC}
     """
     organs = organs or ["liver", "spleen", "kidney"]
+    if set(organs) != {"liver", "spleen", "kidney"}:
+        raise ValueError("Competition scoring requires liver, spleen and kidney")
+    if moving_segmentations is None:
+        raise ValueError("Both CT and MR segmentations are required for DSC")
+    if deformation_field.GetNumberOfComponentsPerPixel() != 3:
+        raise ValueError("Expected a three-component displacement field")
 
-    # 读取固定图像分割标签
-    fixed_segs = {}
+    def same_geometry(left, right):
+        return left.GetSize() == right.GetSize() and all(
+            np.allclose(getattr(left, name)(), getattr(right, name)(), rtol=0, atol=1e-5)
+            for name in ("GetSpacing", "GetOrigin", "GetDirection")
+        )
+
+    if not same_geometry(deformation_field, fixed_image):
+        raise ValueError("Displacement field must use the original CT geometry")
+    transform = sitk.DisplacementFieldTransform(sitk.Cast(deformation_field, sitk.sitkVectorFloat64))
+    fixed_masks, warped_masks = {}, {}
     for organ in organs:
-        if organ in fixed_segmentations:
-            seg_path = fixed_segmentations[organ]
-            if seg_path and Path(seg_path).exists():
-                seg_img = sitk.ReadImage(seg_path)
-                fixed_segs[organ] = sitk.GetArrayFromImage(seg_img)
-
-    if not fixed_segs:
-        warnings.warn("No fixed segmentations found for DSC computation.")
-        return {}
-
-    # 将变形场应用到 moving 图像的分割标签
-    # 注意：这里需要 moving 图像的分割标签
-    # 简化：直接使用 fixed 分割标签经过逆变形场映射
-    warped_segs = {}
-
-    # 使用 SimpleITK 的重采样器将固定图像分割标签映射到变形后的空间
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(moving_image)
-    resampler.SetTransform(sitk.GetDisplacementFieldTransformer(deformation_field))
-    resampler.SetDefaultPixelValue(0)
-    resampler.SetInterpolator(sitk.sitkNearestNeighbor)
-
-    for organ, seg_img_path in fixed_segmentations.items():
-        if seg_img_path and Path(seg_img_path).exists():
-            # 读取分割标签
-            seg_img = sitk.ReadImage(seg_img_path)
-            # 逆变换：将 fixed 空间映射回 moving 空间
-            inv_transform = sitk.DisplacementFieldTransform(deformation_field)
-            inv_transform.InvertTransform()
-            resampler.SetTransform(inv_transform)
-            warped_seg = resampler.Execute(seg_img)
-            warped_segs[organ] = sitk.GetArrayFromImage(warped_seg)
-
-    # 计算各器官 DSC
-    results = {}
-    for organ in organs:
-        if organ in fixed_segs and organ in warped_segs:
-            results[organ] = dice_coefficient(fixed_segs[organ], warped_segs[organ])
-        elif organ in fixed_segs:
-            # 无对应 warped 分割时，预测为全0
-            results[organ] = dice_coefficient(fixed_segs[organ], np.zeros_like(fixed_segs[organ]))
-        else:
-            results[organ] = 0.0
-
-    if results:
-        results["mean"] = np.mean(list(results.values()))
-
-    return results
+        if organ not in fixed_segmentations or organ not in moving_segmentations:
+            raise ValueError(f"Both CT and MR segmentations are required for {organ}")
+        fixed_input, moving_input = fixed_segmentations[organ], moving_segmentations[organ]
+        fixed_seg = fixed_input if isinstance(fixed_input, sitk.Image) else sitk.ReadImage(str(fixed_input))
+        moving_seg = moving_input if isinstance(moving_input, sitk.Image) else sitk.ReadImage(str(moving_input))
+        if not same_geometry(fixed_seg, fixed_image) or not same_geometry(moving_seg, moving_image):
+            raise ValueError(f"Segmentation geometry mismatch for {organ}")
+        warped_seg = sitk.Resample(
+            moving_seg, fixed_image, transform, sitk.sitkNearestNeighbor, 0, moving_seg.GetPixelID()
+        )
+        fixed_masks[organ] = sitk.GetArrayFromImage(fixed_seg)
+        warped_masks[organ] = sitk.GetArrayFromImage(warped_seg)
+    return competition_case_dice(fixed_masks, warped_masks)
 
 
 class DSC_Scorer:
@@ -189,8 +182,18 @@ class DSC_Scorer:
             case_id: 病例编号
             organ_dice: 各器官 DSC 值
         """
-        record = {"case_id": case_id}
-        record.update(organ_dice)
+        if any(r["case_id"] == case_id for r in self.results):
+            raise ValueError(f"Duplicate case ID: {case_id}")
+        missing = set(self.organs) - set(organ_dice)
+        if missing:
+            raise ValueError(f"Missing organ scores: {sorted(missing)}")
+        scores = {organ: float(organ_dice[organ]) for organ in self.organs}
+        if not all(np.isfinite(score) and 0 <= score <= 1 for score in scores.values()):
+            raise ValueError("Organ DSC values must be finite and between 0 and 1")
+        mean_dsc = float(np.mean(list(scores.values())))
+        if "mean" in organ_dice and not np.isclose(organ_dice["mean"], mean_dsc, rtol=0, atol=1e-8):
+            raise ValueError("Case mean must equal the mean of the organ scores")
+        record = {"case_id": case_id, **scores, "mean": mean_dsc}
         self.results.append(record)
 
     def compute(self) -> Dict[str, float]:
@@ -250,6 +253,8 @@ class DSC30_Scorer:
         Args:
             percent: 取最低 DSC 病例的比例（默认 30%）
         """
+        if not 0 < percent <= 1:
+            raise ValueError("DSC30 percentage must be in (0, 1]")
         self.percent = percent
         self.case_scores = []
 
@@ -265,6 +270,10 @@ class DSC30_Scorer:
             mean_dsc: 该病例的平均 DSC（所有器官平均）
             organ_dice: 各器官详细 DSC
         """
+        if any(item["case_id"] == case_id for item in self.case_scores):
+            raise ValueError(f"Duplicate case ID: {case_id}")
+        if not np.isfinite(mean_dsc) or not 0 <= mean_dsc <= 1:
+            raise ValueError("Mean DSC must be finite and between 0 and 1")
         self.case_scores.append({
             "case_id": case_id,
             "mean_dsc": mean_dsc,
@@ -284,7 +293,7 @@ class DSC30_Scorer:
             dict: {"dsc30": float, "worst_cases": [case_ids], "num_worst": int, "total": int}
         """
         if not self.case_scores:
-            return {"dsc30": 0.0, "worst_cases": [], "num_worst": 0, "total": 0, "worst_dsc_values": []}
+            return {"dsc30": None, "worst_cases": [], "num_worst": 0, "total": 0, "worst_dsc_values": []}
 
         # 按 mean_dsc 从低到高排序
         sorted_scores = sorted(self.case_scores, key=lambda x: x["mean_dsc"])
@@ -328,7 +337,8 @@ class DSC30_Scorer:
                 })
 
         if not organ_scores:
-            return {"dsc30": 0.0}
+            return {f"{organ}_dsc30": None, f"{organ}_worst_cases": [],
+                    f"{organ}_num_worst": 0, f"{organ}_total": 0}
 
         sorted_scores = sorted(organ_scores, key=lambda x: x["dsc"])
         total = len(sorted_scores)
@@ -389,12 +399,15 @@ class CompetitionEvaluator:
             organ_dice: 各器官 DSC 值
         """
         self.dsc_scorer.add_case(case_id, organ_dice)
-        mean_dsc = organ_dice.get("mean", np.mean([organ_dice.get(o, 0) for o in self.organs]))
-        self.dsc30_scorer.add_case(case_id, mean_dsc, organ_dice)
+        record = self.dsc_scorer.results[-1]
+        mean_dsc = record["mean"]
+        validated_dice = {organ: record[organ] for organ in self.organs}
+        validated_dice["mean"] = mean_dsc
+        self.dsc30_scorer.add_case(case_id, mean_dsc, validated_dice)
 
         self.detailed_results.append({
             "case_id": case_id,
-            "dsc": organ_dice,
+            "dsc": validated_dice,
             "mean_dsc": mean_dsc,
         })
 
@@ -411,6 +424,8 @@ class CompetitionEvaluator:
         Returns:
             dict: 完整评估报告
         """
+        if not self.detailed_results:
+            raise ValueError("No labeled cases available for DSC evaluation")
         dsc_summary = self.dsc_scorer.compute()
         dsc30_result = self.dsc30_scorer.compute()
 
@@ -420,13 +435,8 @@ class CompetitionEvaluator:
             "per_case_results": self.detailed_results,
         }
 
-        # 计算综合排名分数
-        dsc_mean = dsc_summary.get("overall", {}).get("mean", 0.0)
-        dsc30_value = dsc30_result.get("dsc30", 0.0)
-
-        # 综合分数 = 0.5 * DSC_mean + 0.5 * DSC30
-        report["composite_score"] = 0.5 * dsc_mean + 0.5 * dsc30_value
-        report["composite_score_description"] = "0.5 * DSC_mean + 0.5 * DSC30"
+        # Official ranking is lexicographic, not an invented weighted score.
+        report["ranking_rule"] = {"primary": "DSC", "secondary": "DSC30"}
 
         if save and self.output_dir:
             self._save_report(report)
@@ -464,11 +474,7 @@ class CompetitionEvaluator:
             print(f"  最差病例数: {dsc30['num_worst']}/{dsc30['total']}")
             print(f"  最差病例: {dsc30['worst_cases']}")
 
-        # 综合分数
-        print("\n【综合评分】")
-        print(f"  综合分数 = 0.5 × DSC_mean + 0.5 × DSC30")
-        if "composite_score" in report:
-            print(f"  综合分数 = {report['composite_score']:.4f}")
+        print("\n【排名规则】主指标 DSC，次指标 DSC30")
 
         print("=" * 60 + "\n")
 
@@ -511,7 +517,8 @@ def submit_deformation_fields(
     organ_labels: List[str] = None,
 ) -> Dict[str, Any]:
     """
-    生成变形场提交文件
+    Deprecated: this legacy interface cannot verify CT geometry and its old
+    flat output layout did not satisfy the competition ZIP specification.
 
     Args:
         deformation_fields: 变形场列表（与 case_ids 对应）
@@ -522,43 +529,8 @@ def submit_deformation_fields(
     Returns:
         dict: 提交文件信息
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    submission_info = {
-        "submission_format_version": "1.0",
-        "organ_labels": organ_labels or ["liver", "spleen", "kidney"],
-        "files": [],
-    }
-
-    for case_id, field in zip(case_ids, deformation_fields):
-        if isinstance(field, (str, Path)):
-            # 复制文件到提交目录
-            src = Path(field)
-            dst = output_dir / f"{case_id}_deformation_field.nii.gz"
-            import shutil
-
-            shutil.copy2(src, dst)
-            submission_info["files"].append({
-                "case_id": case_id,
-                "filename": dst.name,
-                "path": str(dst),
-            })
-        elif isinstance(field, sitk.Image):
-            # 直接保存 SimpleITK 图像
-            dst = output_dir / f"{case_id}_deformation_field.nii.gz"
-            sitk.WriteImage(field, str(dst))
-            submission_info["files"].append({
-                "case_id": case_id,
-                "filename": dst.name,
-                "path": str(dst),
-            })
-        else:
-            warnings.warn(f"Unknown deformation field type for case {case_id}: {type(field)}")
-
-    # 保存提交信息
-    info_path = output_dir / "submission_info.json"
-    with open(info_path, "w", encoding="utf-8") as f:
-        json.dump(submission_info, f, indent=2, ensure_ascii=False)
-
-    return submission_info
+    raise RuntimeError(
+        "The legacy flat submission format is unsupported. Use "
+        "experiments/package_submission.py with the original CT data root "
+        "to generate and verify the official competition ZIP."
+    )

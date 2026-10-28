@@ -1,43 +1,33 @@
-"""
-Competition Training Script - 比赛专用训练脚本
+"""One-pass registration diagnostics for the parameter-free competition model.
 
-针对跨模态CT-MR图像配准挑战赛的完整训练流程
-
-训练策略：
-1. 使用配对数据（有监督）
-2. 结合未配对数据（半监督/自监督）
-3. 使用 convex_3d 配准方案（逐图优化，无可学习参数）
-4. 评估指标：DSC / DSC30
+The only registered model optimizes a displacement field for each input pair.
+It does not learn network parameters and therefore cannot produce a checkpoint.
+Validation scores here use resized tensors and are diagnostic, not the
+competition's native-space evaluation.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, ConcatDataset
-from pathlib import Path
-from typing import Optional, Union, List, Dict, Any, Tuple
-import json
 import argparse
-import sys
+import json
+import math
 import random
-import numpy as np
-from tqdm import tqdm
-from datetime import datetime
+import sys
+from pathlib import Path
 
-sys.path.append(str(Path(__file__).parent.parent))
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from medreglab import load_model
-from medreglab.data import (
-    CompetitionDataset,
-    build_transforms,
-)
-from medreglab.evaluation import CompetitionEvaluator
-from medreglab.core import LossBuilder
-from medreglab.models.deformation_field import JacobianField
+from medreglab.data import CompetitionDataset
+
+_SITK_KEYS = {"fixed_sitk", "moving_sitk", "sitk_img"}
+_ORGANS = ("liver", "spleen", "kidney")
 
 
-def set_seed(seed: int = 42):
-    """设置随机种子"""
+def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -45,562 +35,236 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
-# DataLoader 无法 collate SimpleITK.Image 对象，
-# 而训练循环并不需要这些图像元信息，因此直接丢弃。
-_SITK_KEYS = ("fixed_sitk", "moving_sitk", "sitk_img")
-
-
 def _collate_training(batch):
-    """自定义 collate：丢掉 SimpleITK 图像对象，保留张量/字典/标量"""
-    clean = []
-    for sample in batch:
-        item = {k: v for k, v in sample.items() if k not in _SITK_KEYS}
-        # 分割标签统一放到 "segmentations"，供 DSC 计算使用
-        if "seg_moving" in item and "segmentations" not in item:
-            item["segmentations"] = item["seg_moving"] or {}
-        clean.append(item)
-    return torch.utils.data.dataloader.default_collate(clean)
-
-
-def train_competition(
-    config: Dict[str, Any],
-    train_data_dir: Union[str, Path],
-    val_data_dir: Optional[Union[str, Path]] = None,
-    output_dir: Union[str, Path] = "competition_outputs",
-    device: Optional[str] = None,
-    resume_from: Optional[Path] = None,
-):
-    """
-    比赛配准模型训练
-
-    Args:
-        config: 训练配置
-        train_data_dir: 训练数据目录
-        val_data_dir: 验证数据目录
-        output_dir: 输出目录
-        device: 计算设备
-        resume_from: 从检查点恢复
-    """
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "checkpoints").mkdir(exist_ok=True)
-    (output_dir / "logs").mkdir(exist_ok=True)
-
-    # 保存配置
-    config_path = output_dir / "config.json"
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    print(f"[MedRegLab] Training on {device}")
-    print(f"[MedRegLab] Output: {output_dir}")
-    print(f"[MedRegLab] Config: {json.dumps(config, indent=2)}")
-
-    # 设置随机种子
-    set_seed(config.get("seed", 42))
-
-    # 加载模型
-    model_name = config.get("model", "convex_3d")
-    model = load_model(model_name)
-    model = model.to(device)
-
-    if resume_from and Path(resume_from).exists():
-        model.load_state_dict(torch.load(resume_from, map_location=device))
-        print(f"Resumed from {resume_from}")
-
-    # 构建数据集
-    train_dataset = _build_train_dataset(train_data_dir, config)
-    val_dataset = None
-    if val_data_dir:
-        val_dataset = _build_val_dataset(val_data_dir, config)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.get("batch_size", 1),
-        shuffle=True,
-        num_workers=config.get("num_workers", 0),
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,
-        collate_fn=_collate_training,
-    )
-
-    val_loader = None
-    if val_dataset:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=_collate_training,
-        )
-
-    # 优化器
-    # convex_3d 是逐图优化的无参数模型，没有可学习参数；
-    # 此时跳过优化器/反向传播，仅做配准与评估。
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = None
-    if trainable_params:
-        optimizer = torch.optim.Adam(
-            trainable_params,
-            lr=config.get("learning_rate", 1e-4),
-            weight_decay=config.get("weight_decay", 1e-5),
-        )
-    else:
-        print("[MedRegLab] Model has no trainable parameters; "
-              "running registration/evaluation only (no gradient steps).")
-
-    # 学习率调度器
-    scheduler = None
-    if config.get("use_scheduler"):
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.5,
-            patience=10,
-            verbose=True,
-        )
-
-    # 损失函数构建器
-    loss_builder = _build_loss_builder(config, device)
-
-    # 评估器
-    evaluator = None
-    if val_loader:
-        evaluator = CompetitionEvaluator(
-            organs=config.get("organ_labels", ["liver", "spleen", "kidney"]),
-            output_dir=output_dir / "eval_results",
-        )
-
-    # 训练循环
-    num_epochs = config.get("num_epochs", 100)
-    best_val_score = 0.0
-    best_epoch = 0
-    global_step = 0
-    train_history = []
-
-    for epoch in range(num_epochs):
-        # === 训练阶段 ===
-        model.train()
-        epoch_losses = {k: [] for k in ["total", "similarity", "semantic", "tv", "jacobian"]}
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        for batch in pbar:
-            moving = batch["moving"].to(device)
-            fixed = batch["fixed"].to(device)
-
-            # 数据集每个样本已经是 [1, C, D, H, W]，
-            # DataLoader 再加一维会变成 6D，这里压回 5D。
-            if moving.dim() == 6:
-                moving = moving.squeeze(0)
-            if fixed.dim() == 6:
-                fixed = fixed.squeeze(0)
-
-            # 前向传播
-            result = model(moving, fixed)
-
-            # 计算损失
-            losses = _compute_losses(
-                result, fixed, loss_builder, config, device
-            )
-
-            total_loss = losses["total_tensor"]
-
-            # 反向传播（仅当模型有可学习参数时）
-            if optimizer is not None:
-                optimizer.zero_grad()
-                total_loss.backward()
-                if config.get("max_grad_norm"):
-                    torch.nn.utils.clip_grad_norm_(
-                        trainable_params, config["max_grad_norm"]
-                    )
-                optimizer.step()
-
-            # 记录损失
-            epoch_losses["total"].append(losses.get("total", 0))
-            epoch_losses["similarity"].append(losses.get("similarity", 0))
-            epoch_losses["semantic"].append(losses.get("semantic", 0))
-            epoch_losses["tv"].append(losses.get("tv", 0))
-            epoch_losses["jacobian"].append(losses.get("jacobian", 0))
-
-            pbar.set_postfix({
-                "loss": f"{losses.get('total', 0):.4f}",
-                "sim": f"{losses.get('similarity', 0):.4f}",
-            })
-
-            global_step += 1
-
-        # === 验证阶段 ===
-        val_metrics = None
-        if val_loader is not None:
-            model.eval()
-            val_losses = []
-            val_evaluator = CompetitionEvaluator(
-                organs=config.get("organ_labels", ["liver", "spleen", "kidney"]),
-            )
-
-            # convex_3d 内部需要对 phi 做 autograd 优化，
-            # 所以这里不能用 torch.no_grad()。
-            with torch.enable_grad():
-                for batch in tqdm(val_loader, desc="Validating"):
-                    moving = batch["moving"].to(device)
-                    fixed = batch["fixed"].to(device)
-
-                    # 与训练阶段一致：压回 5D
-                    if moving.dim() == 6:
-                        moving = moving.squeeze(0)
-                    if fixed.dim() == 6:
-                        fixed = fixed.squeeze(0)
-
-                    result = model(moving, fixed)
-                    val_loss = F.mse_loss(result["warped"], fixed)
-                    val_losses.append(val_loss.item())
-
-                    # 计算 DSC（如果有分割标签）
-                    if batch.get("has_segmentations") and batch["segmentations"]:
-                        case_id = batch.get("case_id", ["val"])[0]
-                        dsc = _compute_batch_dsc(batch, result, device)
-                        if dsc:
-                            val_evaluator.add_case(case_id, dsc)
-
-            val_metrics = val_evaluator.evaluate(save=False)
-
-            # 学习率调度
-            if scheduler is not None:
-                val_loss_mean = np.mean(val_losses)
-                scheduler.step(val_loss_mean)
-
-        # === 汇总 epoch 结果 ===
-        avg_losses = {k: np.mean(v) for k, v in epoch_losses.items() if v}
-        train_history.append({
-            "epoch": epoch + 1,
-            "train_losses": avg_losses,
-            "val_metrics": val_metrics,
-        })
-
-        # 打印结果
-        print(f"\nEpoch {epoch+1}/{num_epochs}:")
-        print(f"  Train Loss: {avg_losses.get('total', 0):.4f} | "
-              f"Sim: {avg_losses.get('similarity', 0):.4f} | "
-              f"TV: {avg_losses.get('tv', 0):.4f}")
-
-        if val_metrics:
-            dsc_mean = val_metrics.get("DSC", {}).get("overall", {}).get("mean", 0)
-            dsc30 = val_metrics.get("DSC30", {}).get("dsc30", 0)
-            print(f"  Val DSC: {dsc_mean:.4f} | DSC30: {dsc30:.4f}")
-
-            # 保存最佳模型
-            composite = val_metrics.get("composite_score", 0)
-            if composite > best_val_score:
-                best_val_score = composite
-                best_epoch = epoch + 1
-                if trainable_params:
-                    torch.save(
-                        model.state_dict(),
-                        output_dir / "checkpoints" / "best_model.pth"
-                    )
-                    print(f"  ★ Saved best model (score={best_val_score:.4f})")
-
-        # 定期保存
-        if trainable_params and (epoch + 1) % config.get("save_interval", 10) == 0:
-            torch.save(
-                model.state_dict(),
-                output_dir / "checkpoints" / f"model_epoch_{epoch+1}.pth"
-            )
-
-    # === 保存最终模型 ===
-    if trainable_params:
-        torch.save(model.state_dict(), output_dir / "checkpoints" / "final_model.pth")
-
-    # 保存训练历史
-    with open(output_dir / "logs" / "train_history.json", "w") as f:
-        json.dump(train_history, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
-
-    print(f"\n[MedRegLab] Training completed!")
-    print(f"  Best epoch: {best_epoch} (score={best_val_score:.4f})")
-    print(f"  Models saved to {output_dir / 'checkpoints'}")
-
-
-def _build_train_dataset(
-    data_dir: Union[str, Path], config: Dict[str, Any]
-) -> CompetitionDataset:
-    """构建训练数据集"""
-    target_size = tuple(config.get("target_size", [128, 128, 128]))
-    transforms = build_transforms(
-        split="train",
-        target_size=target_size,
-        elastic_deform=config.get("elastic_deform", True),
-        random_flip=config.get("random_flip", True),
-        intensity_aug=config.get("intensity_aug", True),
-    )
-
-    dataset = CompetitionDataset(
-        root=data_dir,
-        split="train",
-        transforms=transforms,
-        target_size=target_size,
-    )
-    return dataset
-
-
-def _build_val_dataset(
-    data_dir: Union[str, Path], config: Dict[str, Any]
-) -> CompetitionDataset:
-    """构建验证数据集"""
-    target_size = tuple(config.get("target_size", [128, 128, 128]))
-
-    dataset = CompetitionDataset(
-        root=data_dir,
-        split="val",
-        transforms=None,
-        target_size=target_size,
-    )
-    return dataset
-
-
-def _build_loss_builder(config: Dict[str, Any], device: torch.device):
-    """构建损失函数构建器"""
-    loss_types = config.get("loss_types", ["mse", "ncc"])
-    loss_weights = config.get("loss_weights", {"mse": 1.0, "ncc": 1.0})
-
-    loss_builder = LossBuilder(
-        losses=loss_types,
-        weights=loss_weights,
-        impact_weight=config.get("impact_weight", 0.5),
-        tv_weight=config.get("tv_weight", 0.05),
-        jacobian_weight=config.get("jacobian_weight", 0.01),
-    )
-    return loss_builder
-
-
-def _compute_losses(
-    result: Dict[str, Any],
-    fixed: torch.Tensor,
-    loss_builder: LossBuilder,
-    config: Dict[str, Any],
-    device: torch.device,
-) -> Dict[str, float]:
-    """计算训练损失"""
-    warped = result["warped"]
-    phi = result.get("phi")
-
-    losses = {}
-
-    # 相似性损失
-    sim_loss = 0.0
-    if "mse" in config.get("loss_types", []):
-        sim_loss += F.mse_loss(warped, fixed)
-    if "ncc" in config.get("loss_types", []):
-        # 全局 NCC
-        ncc = _ncc_loss(warped, fixed)
-        sim_loss += 1 - ncc
-
-    losses["similarity"] = sim_loss.item()
-    total_loss = sim_loss
-
-    # 语义损失（IMPACT）
-    if config.get("use_impact_loss") and "semantic_loss" in result:
-        sem_loss = result["semantic_loss"]
-        losses["semantic"] = sem_loss.item() if isinstance(sem_loss, torch.Tensor) else sem_loss
-        total_loss = total_loss + config.get("impact_weight", 0.5) * sem_loss
-
-    # TV 正则化
-    if phi is not None and config.get("tv_weight", 0) > 0:
-        tv_loss = _tv_regularization(phi)
-        losses["tv"] = tv_loss.item()
-        total_loss = total_loss + config.get("tv_weight", 0) * tv_loss
-
-    # Jacobian 正则化
-    if phi is not None and config.get("jacobian_weight", 0) > 0:
-        jac_loss = _jacobian_penalty(phi)
-        losses["jacobian"] = jac_loss.item()
-        total_loss = total_loss + config.get("jacobian_weight", 0) * jac_loss
-
-    losses["total"] = total_loss.item()
-    losses["total_tensor"] = total_loss
-
-    return losses
-
-
-def _ncc_loss(I: torch.Tensor, J: torch.Tensor) -> torch.Tensor:
-    """归一化互相关"""
-    I_mean = I.mean()
-    J_mean = J.mean()
-    I_std = I.std()
-    J_std = J.std()
-    ncc = ((I - I_mean) * (J - J_mean)).mean() / (I_std * J_std + 1e-8)
-    return ncc
-
-
-def _tv_regularization(phi: torch.Tensor) -> torch.Tensor:
-    """全变差正则化"""
-    if phi.dim() == 5:  # 3D [B, 3, D, H, W]
-        dx = phi[:, :, 1:, :, :] - phi[:, :, :-1, :, :]
-        dy = phi[:, :, :, 1:, :] - phi[:, :, :, :-1, :]
-        dz = phi[:, :, :, :, 1:] - phi[:, :, :, :, :-1]
-        tv = (
-            torch.mean(torch.sqrt(dx * dx + 1e-8))
-            + torch.mean(torch.sqrt(dy * dy + 1e-8))
-            + torch.mean(torch.sqrt(dz * dz + 1e-8))
-        )
-    else:  # 2D [B, 2, H, W]
-        dx = phi[:, :, 1:, :] - phi[:, :, :-1, :]
-        dy = phi[:, :, :, 1:] - phi[:, :, :, :-1]
-        tv = torch.mean(torch.sqrt(dx * dx + 1e-8)) + torch.mean(
-            torch.sqrt(dy * dy + 1e-8)
-        )
-    return tv
-
-
-def _jacobian_penalty(phi: torch.Tensor) -> torch.Tensor:
-    """Jacobian 行列式惩罚（防止折叠）"""
-    # 简化：使用 Jacobian 行列式的方差
-    jac = JacobianField.compute(phi)
-    return torch.var(jac)
-
-
-def _compute_batch_dsc(
-    batch: Dict[str, Any],
-    result: Dict[str, Any],
-    device: torch.device,
-) -> Optional[Dict[str, float]]:
-    """计算批次的 DSC"""
-    from medreglab.evaluation import dice_coefficient
-
-    warped = result["warped"]
-    phi = result.get("phi")
-    moving = batch["moving"]
-
-    if phi is None or not batch.get("has_segmentations"):
-        return None
-
-    organ_labels = ["liver", "spleen", "kidney"]
-    dsc_values = {}
-
-    # 对每个器官计算 DSC
-    # 这里简化处理：使用 moving 分割经过形变后与 fixed 位置的相似度
-    for organ in organ_labels:
-        if organ in batch.get("segmentations", {}):
-            moving_seg = batch["segmentations"][organ].to(device)
-
-            # 形变 moving 分割
-            warped_seg = _warp_label(moving_seg, phi)
-            moving_seg_binary = (moving_seg > 0.5).float()
-            warped_seg_binary = (warped_seg > 0.5).float()
-
-            # Dice: warped seg vs original moving seg position
-            dsc = dice_coefficient(warped_seg_binary, moving_seg_binary)
-            dsc_values[organ] = dsc
-
-    if dsc_values:
-        dsc_values["mean"] = float(np.mean(list(dsc_values.values())))
-
-    return dsc_values
-
-
-def _warp_label(label: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
-    """将标签变形"""
-    B, C, D, H, W = label.shape
-    device = label.device
-
-    grid_d = torch.linspace(-1, 1, D, device=device)
-    grid_h = torch.linspace(-1, 1, H, device=device)
-    grid_w = torch.linspace(-1, 1, W, device=device)
-    grid_d, grid_h, grid_w = torch.meshgrid(grid_d, grid_h, grid_w, indexing="ij")
-
-    phi_norm = phi.squeeze(0).clone()
-    phi_norm[0] = 2 * phi_norm[0] / D
-    phi_norm[1] = 2 * phi_norm[1] / H
-    phi_norm[2] = 2 * phi_norm[2] / W
-
-    grid = torch.stack([grid_d, grid_h, grid_w], dim=-1)
-    grid = grid + phi_norm.permute(1, 2, 3, 0)
-    grid = grid.unsqueeze(0)
-
-    warped = F.grid_sample(
-        label, grid, mode="nearest", padding_mode="border", align_corners=True
-    )
-    return warped
-
-
-# === 快速测试接口 ===
-def quick_train(
-    train_data_dir: str,
-    val_data_dir: Optional[str] = None,
-    output_dir: str = "competition_outputs",
-    model_name: str = "convex_3d",
-    num_epochs: int = 50,
-    batch_size: int = 1,
-    target_size: List[int] = None,
-    learning_rate: float = 1e-4,
-):
-    """快速训练接口"""
-    target_size = target_size or [128, 128, 128]
-    config = {
-        "model": model_name,
-        "batch_size": batch_size,
-        "num_epochs": num_epochs,
-        "learning_rate": learning_rate,
-        "target_size": target_size,
-        "loss_types": ["mse", "ncc"],
-        "loss_weights": {"mse": 1.0, "ncc": 1.0},
-        "use_impact_loss": True,
-        "impact_weight": 0.5,
-        "tv_weight": 0.05,
-        "jacobian_weight": 0.01,
-        "elastic_deform": True,
-        "random_flip": True,
-        "intensity_aug": True,
-        "save_interval": 10,
-        "organ_labels": ["liver", "spleen", "kidney"],
-        "seed": 42,
+    """Collate one sample without passing SimpleITK objects to PyTorch."""
+    if len(batch) != 1:
+        raise ValueError("convex_3d diagnostics require batch_size=1")
+    sample = {key: value for key, value in batch[0].items()
+              if key not in _SITK_KEYS and value is not None}
+    return torch.utils.data.dataloader.default_collate([sample])
+
+
+def _configuration(config):
+    """Normalize supported flat or YAML sections, rejecting ineffective options."""
+    training = config.get("training") or {}
+    registration = config.get("registration") or {}
+    data = config.get("data") or {}
+    augmentation = config.get("augmentation") or {}
+    def pick(name, section, default):
+        return config[name] if name in config else section.get(name, default)
+
+    result = {
+        "model": config.get("model", "convex_3d"),
+        "num_epochs": pick("num_epochs", training, 1),
+        "batch_size": pick("batch_size", training, 1),
+        "num_workers": pick("num_workers", training, 0),
+        "seed": pick("seed", training, 42),
+        "target_size": pick("target_size", data, [128, 128, 128]),
+        "max_iter": pick("max_iter", registration, 100),
+        "lr": config.get("registration_lr", registration.get("lr", 0.1)),
+        "tv_weight": config.get("registration_tv_weight", registration.get("tv_weight", 0.01)),
+        "similarity": pick("similarity", registration, "mse"),
     }
+    if result["model"] != "convex_3d":
+        raise ValueError("Only convex_3d is available")
+    if result["num_epochs"] != 1:
+        raise ValueError("convex_3d learns no network parameters; use one diagnostics pass (--epochs 1)")
+    if result["batch_size"] != 1:
+        raise ValueError("convex_3d diagnostics currently require batch_size=1")
+    if not isinstance(result["max_iter"], int) or isinstance(result["max_iter"], bool) or result["max_iter"] <= 0:
+        raise ValueError("max_iter must be a positive integer")
+    if not isinstance(result["num_workers"], int) or result["num_workers"] < 0:
+        raise ValueError("num_workers must be a nonnegative integer")
+    if len(result["target_size"]) != 3 or any(not isinstance(n, int) or n < 2 for n in result["target_size"]):
+        raise ValueError("target_size must contain three integers >= 2")
+    if not math.isfinite(result["lr"]) or result["lr"] <= 0:
+        raise ValueError("registration lr must be finite and positive")
+    if not math.isfinite(result["tv_weight"]) or result["tv_weight"] < 0:
+        raise ValueError("registration tv_weight must be finite and nonnegative")
+    if result["similarity"] not in ("mse", "ncc"):
+        raise ValueError("similarity must be mse or ncc")
+    if pick("use_scheduler", training, False):
+        raise ValueError("No scheduler is applicable: convex_3d has no trainable network parameters")
+    for name in ("elastic_deform", "random_flip", "intensity_aug"):
+        if config.get(name, augmentation.get(name, False)):
+            raise ValueError(f"{name} is not supported by the one-pass diagnostic runner")
+    return result
 
-    train_competition(
-        config=config,
-        train_data_dir=train_data_dir,
-        val_data_dir=val_data_dir,
-        output_dir=output_dir,
+
+def _build_train_dataset(data_dir, config):
+    if not (Path(data_dir) / "train").is_dir():
+        raise FileNotFoundError(f"Training directory missing: {Path(data_dir) / 'train'}")
+    dataset = CompetitionDataset(root=data_dir, split="train", transforms=None,
+                                 target_size=tuple(config["target_size"]))
+    if not len(dataset):
+        raise ValueError("Training split contains no paired cases")
+    return dataset
+
+
+def _build_val_dataset(data_dir, config):
+    if not (Path(data_dir) / "val").is_dir():
+        raise FileNotFoundError(f"Explicit validation directory missing: {Path(data_dir) / 'val'}")
+    dataset = CompetitionDataset(root=data_dir, split="val", transforms=None,
+                                 target_size=tuple(config["target_size"]))
+    if not len(dataset):
+        raise ValueError("Validation split contains no paired cases")
+    return dataset
+
+
+def _check_disjoint(train_dataset, val_dataset):
+    train_ids = {sample["case_id"] for sample in train_dataset.samples}
+    val_ids = {sample["case_id"] for sample in val_dataset.samples}
+    if train_ids & val_ids:
+        raise ValueError(f"Training and validation case IDs overlap: {sorted(train_ids & val_ids)}")
+    train_paths = {str(Path(sample[key]).resolve()) for sample in train_dataset.samples
+                   for key in ("fixed_path", "moving_path")}
+    val_paths = {str(Path(sample[key]).resolve()) for sample in val_dataset.samples
+                 for key in ("fixed_path", "moving_path")}
+    if train_paths & val_paths:
+        raise ValueError("Training and validation reuse image files")
+
+
+def _batch_image(batch, key, device):
+    value = batch[key].to(device)
+    if value.ndim == 6 and value.shape[1] == 1:
+        value = value.squeeze(1)
+    if value.ndim != 5:
+        raise ValueError(f"Expected [B,C,D,H,W] after collation for {key}; got {tuple(value.shape)}")
+    return value
+
+
+def _warp_label(label, phi):
+    """Nearest-neighbor pull in the model's x=W, y=H, z=D voxel convention."""
+    if label.ndim != 5 or phi.ndim != 5 or label.shape[0] != phi.shape[0] or phi.shape[1] != 3:
+        raise ValueError("Expected label [B,1,D,H,W] and phi [B,3,D,H,W]")
+    batch, _, depth, height, width = label.shape
+    if tuple(phi.shape[2:]) != (depth, height, width) or min(depth, height, width) < 2:
+        raise ValueError("Label and field must have the same 3D grid with dimensions >= 2")
+    z, y, x = torch.meshgrid(
+        torch.linspace(-1, 1, depth, device=phi.device, dtype=phi.dtype),
+        torch.linspace(-1, 1, height, device=phi.device, dtype=phi.dtype),
+        torch.linspace(-1, 1, width, device=phi.device, dtype=phi.dtype), indexing="ij",
     )
+    base = torch.stack((x, y, z), dim=-1).unsqueeze(0).expand(batch, -1, -1, -1, -1)
+    scale = phi.new_tensor([2 / (width - 1), 2 / (height - 1), 2 / (depth - 1)])
+    grid = base + phi.permute(0, 2, 3, 4, 1) * scale
+    return F.grid_sample(label.to(device=phi.device, dtype=phi.dtype), grid,
+                         mode="nearest", padding_mode="zeros", align_corners=True)
+
+
+def _compute_batch_dsc(batch, result, device):
+    """CT vs warped MR on the resized diagnostic grid, not official native DSC."""
+    from medreglab.evaluation import competition_case_dice
+    fixed_masks, moving_masks = batch.get("seg_fixed"), batch.get("seg_moving")
+    if fixed_masks is None or moving_masks is None:
+        return None
+    if any(organ not in fixed_masks or organ not in moving_masks for organ in _ORGANS):
+        raise ValueError("Expected liver, spleen and kidney masks for both CT and MR")
+    phi = result["phi"].to(device)
+    warped = {organ: _warp_label(moving_masks[organ].to(device).float(), phi)[0, 0]
+              for organ in _ORGANS}
+    fixed = {organ: fixed_masks[organ].to(device)[0, 0] for organ in _ORGANS}
+    return competition_case_dice(fixed, warped)
+
+
+def train_competition(config, train_data_dir, val_data_dir=None,
+                      output_dir="competition_outputs", device=None, resume_from=None):
+    """Run one diagnostic pass; no learned weights/checkpoints are produced."""
+    settings = _configuration(config)
+    if resume_from is not None:
+        raise ValueError("convex_3d has no learned checkpoint; omit --resume")
+    output = Path(output_dir)
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise FileExistsError(f"Output already contains data; choose a new directory: {output}")
+    train_dataset = _build_train_dataset(train_data_dir, settings)
+    val_dataset = _build_val_dataset(val_data_dir, settings) if val_data_dir is not None else None
+    if val_dataset is not None:
+        _check_disjoint(train_dataset, val_dataset)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(settings["model"]).to(device)
+    if any(parameter.requires_grad for parameter in model.parameters()):
+        raise ValueError("This diagnostic runner supports parameter-free convex_3d only")
+    model.max_iter = settings["max_iter"]
+    model.lr = settings["lr"]
+    model.tv_weight = settings["tv_weight"]
+    model.similarity = settings["similarity"]
+    set_seed(settings["seed"])
+    loader_options = {"batch_size": 1, "shuffle": False, "num_workers": settings["num_workers"],
+                      "collate_fn": _collate_training}
+    train_loader = DataLoader(train_dataset, **loader_options)
+    val_loader = DataLoader(val_dataset, **loader_options) if val_dataset is not None else None
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "logs").mkdir(exist_ok=True)
+    (output / "config.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    print(f"[MedRegLab] One-pass per-pair registration diagnostics on {device}; no learned checkpoint")
+    records = []
+    with torch.enable_grad():
+        for batch in train_loader:
+            moving, fixed = _batch_image(batch, "moving", device), _batch_image(batch, "fixed", device)
+            result = model(moving, fixed)
+            records.append({"case_id": batch["case_id"][0], "objective": float(result["loss"]),
+                            "iterations": len(result["loss_history"])})
+        validation = []
+        if val_loader is not None:
+            for batch in val_loader:
+                moving, fixed = _batch_image(batch, "moving", device), _batch_image(batch, "fixed", device)
+                result = model(moving, fixed)
+                validation.append({"case_id": batch["case_id"][0], "objective": float(result["loss"]),
+                                   "resized_grid_diagnostic_dsc": _compute_batch_dsc(batch, result, device)})
+    summary = {
+        "mode": "one_pass_per_pair_registration_diagnostics",
+        "model": settings["model"],
+        "learned_network_parameters": False,
+        "checkpoint_saved": False,
+        "training_cases": records,
+        "validation_cases": validation,
+        "validation_dsc_scope": "resized_grid_diagnostic_not_official_native_space",
+    }
+    (output / "logs" / "train_history.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[MedRegLab] Diagnostics finished: {len(records)} train, {len(validation)} validation cases")
+    return summary
+
+
+def quick_train(train_data_dir, val_data_dir=None, output_dir="competition_outputs",
+                model_name="convex_3d", num_epochs=1, batch_size=1,
+                target_size=None, learning_rate=0.1):
+    """Compatibility wrapper; learning_rate controls per-pair displacement Adam."""
+    return train_competition({"model": model_name, "num_epochs": num_epochs, "batch_size": batch_size,
+                              "target_size": target_size or [128, 128, 128],
+                              "registration_lr": learning_rate},
+                             train_data_dir, val_data_dir, output_dir)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", required=True, help="Dataset root containing train/")
+    parser.add_argument("--val", help="Dataset root containing a separate val/ split")
+    parser.add_argument("--output", default="competition_outputs", help="New/empty output directory")
+    parser.add_argument("--config", help="Optional configs/competition_config.yaml")
+    parser.add_argument("--model", help="Only convex_3d is available")
+    parser.add_argument("--epochs", type=int, help="Must be 1: this model has no learnable parameters")
+    parser.add_argument("--batch_size", type=int, help="Must be 1")
+    parser.add_argument("--lr", type=float, help="Per-pair displacement Adam learning rate")
+    parser.add_argument("--tv_weight", type=float, help="Per-pair displacement TV weight")
+    parser.add_argument("--similarity", choices=["mse", "ncc"])
+    parser.add_argument("--max_iter", type=int, help="Maximum per-pair optimizer iterations")
+    parser.add_argument("--target_size", type=int, nargs=3, metavar=("D", "H", "W"))
+    parser.add_argument("--resume", help="Unsupported: convex_3d has no checkpoint")
+    args = parser.parse_args()
+    config = {}
+    if args.config:
+        import yaml
+        with open(args.config, encoding="utf-8") as stream:
+            config = yaml.safe_load(stream) or {}
+        if not isinstance(config, dict):
+            raise ValueError("Config must contain a mapping")
+    overrides = {"model": args.model, "num_epochs": args.epochs, "batch_size": args.batch_size,
+                 "registration_lr": args.lr, "registration_tv_weight": args.tv_weight,
+                 "similarity": args.similarity, "max_iter": args.max_iter, "target_size": args.target_size}
+    config.update({key: value for key, value in overrides.items() if value is not None})
+    train_competition(config, args.data, args.val, args.output, resume_from=args.resume)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train registration model for competition")
-    parser.add_argument("--data", type=str, required=True, help="Training data directory")
-    parser.add_argument("--val", type=str, help="Validation data directory")
-    parser.add_argument("--output", type=str, default="competition_outputs", help="Output directory")
-    parser.add_argument("--model", type=str, default="convex_3d", help="Model name")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--target_size", type=int, nargs="+", default=[128, 128, 128], help="Target size D H W")
-    parser.add_argument("--resume", type=str, help="Resume from checkpoint")
-
-    args = parser.parse_args()
-
-    config = {
-        "model": args.model,
-        "batch_size": args.batch_size,
-        "num_epochs": args.epochs,
-        "learning_rate": args.lr,
-        "target_size": list(args.target_size),
-        "loss_types": ["mse", "ncc"],
-        "loss_weights": {"mse": 1.0, "ncc": 1.0},
-        "use_impact_loss": True,
-        "impact_weight": 0.5,
-        "tv_weight": 0.05,
-        "jacobian_weight": 0.01,
-        "elastic_deform": True,
-        "random_flip": True,
-        "intensity_aug": True,
-        "save_interval": 10,
-        "organ_labels": ["liver", "spleen", "kidney"],
-        "seed": 42,
-    }
-
-    train_competition(
-        config=config,
-        train_data_dir=args.data,
-        val_data_dir=args.val,
-        output_dir=args.output,
-        resume_from=args.resume,
-    )
+    main()

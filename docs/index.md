@@ -5,10 +5,10 @@
 ## 快速开始
 
 ```bash
-source /data1/MedRegLab/activate_env.sh
 cd /data1/MedRegLab
-python -m pytest tests/ -q          # 6 passed
-bash selfcheck.sh                   # 9 项自检
+source scripts/activate_medreg_env.sh
+python -m pytest tests/ -q
+bash selfcheck.sh                   # 默认仅使用合成数据
 ```
 
 ### 配准
@@ -31,12 +31,12 @@ python experiments/infer_competition.py \
     --output competition_output --model convex_3d
 ```
 
-### 训练
+### 单轮逐例诊断
 
 ```bash
 python experiments/train_competition.py \
-    --data Datasets --model convex_3d \
-    --epochs 50 --output competition_outputs
+    --config configs/competition_config.yaml --data Datasets \
+    --output outputs/NEW_DIAGNOSTIC
 ```
 
 ## 组件
@@ -53,7 +53,7 @@ python experiments/train_competition.py \
 
 | 方法 | 论文 | 年份 | 状态 |
 |------|------|------|------|
-| ConvexAdam (3D) | ConvexAdam: Bayesian Inverse Problems with Convex Penalty | 2021 | ✅ 可用（`convex_3d`） |
+| Simple3DRegistration | 无训练权重的逐例 Adam + MSE/NCC + TV 基线 | — | ✅ 可用（`convex_3d`；不是论文原版 ConvexAdam） |
 | DINO-Reg | DINO-Reg: Self-supervised Deformable Image Registration | 2023 | ❌ 后端已损坏，代码已清理 |
 | IMPACT | IMPACT: Implicit Neural Penalty based Adversarial Cross-domain Transform | 2023 | ❌ 后端已损坏，代码已清理 |
 

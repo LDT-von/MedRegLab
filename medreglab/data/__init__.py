@@ -7,6 +7,7 @@ from .dataset import (
     PairedVolumeDataset,
     ORGAN_LABELS,
     ORGANS_FOR_DSC,
+    competition_masks_from_labels,
 )
 from .transforms import (
     RandomAugmentation,
@@ -20,6 +21,7 @@ __all__ = [
     "PairedVolumeDataset",
     "ORGAN_LABELS",
     "ORGANS_FOR_DSC",
+    "competition_masks_from_labels",
     "RandomAugmentation",
     "build_transforms",
     "build_dataloader",

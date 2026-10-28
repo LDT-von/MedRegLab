@@ -14,6 +14,7 @@ import SimpleITK as sitk
 from pathlib import Path
 from typing import Optional, Union, List, Dict, Any, Tuple
 import json
+import hashlib
 import argparse
 import sys
 from tqdm import tqdm
@@ -23,9 +24,18 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from medreglab import load_model
 from medreglab.data import CompetitionDataset
-from medreglab.evaluation import CompetitionEvaluator, dice_coefficient
-from medreglab.utils import load_image, save_image
-from medreglab.models.deformation_field import JacobianField
+from medreglab.evaluation import CompetitionEvaluator
+from medreglab.utils.submission import (
+    displacement_to_fixed_grid, warp_original_moving, grid_folding_statistics,
+)
+
+
+def _sha256_file(path: Union[str, Path]) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def run_competition_inference(
@@ -60,9 +70,20 @@ def run_competition_inference(
     Returns:
         dict: 推理结果统计
     """
+    if split not in ("test", "val", "validation"):
+        raise ValueError(f"Unsupported split: {split!r}")
+    if not isinstance(max_iter, int) or isinstance(max_iter, bool) or max_iter <= 0:
+        raise ValueError("max_iter must be a positive integer")
+    if target_size is not None and (len(target_size) != 3 or any(n < 2 for n in target_size)):
+        raise ValueError("target_size must contain three dimensions of at least two voxels")
+    if model_path is not None:
+        raise ValueError("convex_3d has no learned checkpoint; omit --checkpoint")
+    if save_vis:
+        raise NotImplementedError("save_vis is not implemented")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+        raise FileExistsError(f"Refusing to overwrite a nonempty output directory: {output_dir}")
 
     from medreglab.data import ORGANS_FOR_DSC
     organ_labels = organ_labels or ORGANS_FOR_DSC
@@ -84,12 +105,13 @@ def run_competition_inference(
 
     # 加载模型
     model = load_model(model_name)
-    if model_path and Path(model_path).exists():
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print(f"Loaded model from {model_path}")
+    model.max_iter = max_iter
     model = model.to(device)
     model.eval()
 
+    # A submission must never silently fall back to training data.
+    if split == "test" and not (Path(data_root) / "test").is_dir():
+        raise FileNotFoundError(f"Missing test directory: {Path(data_root) / 'test'}")
     # 创建数据集
     dataset = CompetitionDataset(
         root=data_root,
@@ -97,12 +119,15 @@ def run_competition_inference(
         target_size=target_size,
     )
     print(f"[MedRegLab] Loaded {len(dataset)} samples")
+    if not len(dataset):
+        raise ValueError("No cases found; refusing to create an empty submission")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 创建评估器（仅 split=="val" 时计算 DSC）
     evaluator = None
     if split in ("val", "validation"):
         evaluator = CompetitionEvaluator(
-            organs=organ_labels,
+            organs=report_organs,
             output_dir=output_dir / "eval_results",
         )
 
@@ -119,10 +144,16 @@ def run_competition_inference(
 
     with torch.enable_grad():
         for idx in tqdm(range(len(dataset)), desc=f"Registering ({split})"):
-            sample = dataset[idx]
-            case_id = sample.get("case_id", f"case_{idx:04d}")
-
+            sample_info = dataset.get_sample_info(idx)
+            case_id = sample_info.get("case_id", f"case_{idx:04d}")
             try:
+                input_hashes = {
+                    "ct_input_sha256": _sha256_file(sample_info["fixed_path"]),
+                    "mr_input_sha256": _sha256_file(sample_info["moving_path"]),
+                }
+                sample = dataset[idx]
+                if sample.get("spatial_augmented"):
+                    raise ValueError("Spatially augmented tensors cannot be exported using original image geometry")
                 # 准备输入 (sample 已是 5D [1, C, D, H, W])
                 fixed = sample["fixed"].to(device)
                 moving = sample["moving"].to(device)
@@ -135,24 +166,12 @@ def run_competition_inference(
                 result = model(moving, fixed)
 
                 # 获取变形场
-                phi = result["phi"].cpu()
-                warped = result["warped"].cpu()
+                phi = result["phi"].detach().cpu()
 
                 # === 生成提交文件 ===
-                # 变形场格式: [D, H, W] displacement vectors
-                phi_np = phi.squeeze().numpy()  # [3, D, H, W] 或 [2, H, W]
-
-                # 转换形状: displacement field 应该是 [D, H, W, 3]
-                if phi_np.ndim == 4:  # 3D [3, D, H, W]
-                    phi_submit = np.transpose(phi_np, (1, 2, 3, 0))  # [D, H, W, 3]
-                else:  # 2D [2, H, W]
-                    phi_submit = np.transpose(phi_np, (1, 2, 0))  # [H, W, 2]
-
-                # 创建 SimpleITK 位移场
-                deform_img = sitk.GetImageFromArray(phi_submit, isVector=True)
-                deform_img.SetSpacing(sample["fixed_sitk"].GetSpacing())
-                deform_img.SetOrigin(sample["fixed_sitk"].GetOrigin())
-                deform_img.SetDirection(sample["fixed_sitk"].GetDirection())
+                deform_img = displacement_to_fixed_grid(
+                    phi, sample["fixed_sitk"], sample["moving_sitk"]
+                )
 
                 # 保存变形场
                 deform_path = deform_dir / f"{case_id}_deformation_field.nii.gz"
@@ -160,37 +179,39 @@ def run_competition_inference(
 
                 # 保存配准后的图像
                 if save_warped:
-                    warped_np = warped.squeeze().numpy()
-                    warped_img = sitk.GetImageFromArray(warped_np)
-                    # 不要用 CopyInformation（会校验尺寸），手动设置原图元信息
-                    warped_img.SetSpacing(sample["moving_sitk"].GetSpacing())
-                    warped_img.SetOrigin(sample["moving_sitk"].GetOrigin())
-                    try:
-                        warped_img.SetDirection(sample["moving_sitk"].GetDirection())
-                    except Exception:
-                        pass
+                    warped_img = warp_original_moving(
+                        sample["moving_sitk"], sample["fixed_sitk"], deform_img
+                    )
                     sitk.WriteImage(warped_img, str(warped_dir / f"{case_id}_warped.nii.gz"))
 
+                if input_hashes != {
+                    "ct_input_sha256": _sha256_file(sample_info["fixed_path"]),
+                    "mr_input_sha256": _sha256_file(sample_info["moving_path"]),
+                }:
+                    raise RuntimeError("CT or MR input changed during registration")
+                case_result = {
+                    "case_id": case_id,
+                    "loss": float(result["loss"]),
+                    "iterations": len(result["loss_history"]),
+                    "fixed_size_xyz": list(sample["fixed_sitk"].GetSize()),
+                    "moving_size_xyz": list(sample["moving_sitk"].GetSize()),
+                    **input_hashes,
+                    "field_sha256": _sha256_file(deform_path),
+                }
                 # === 计算 DSC（仅验证集有标签）===
-                if evaluator is not None and sample.get("has_segmentations"):
+                if evaluator is not None:
                     dsc_result = _compute_dsc_for_sample(
-                        sample, phi, organ_labels
+                        sample, deform_img, sample_info.get("seg_fixed_path"),
+                        sample_info.get("seg_moving_path"), report_organs,
                     )
-                    if dsc_result:
-                        evaluator.add_case(case_id, dsc_result)
-                        results.append({
-                            "case_id": case_id,
-                            "mean_dsc": dsc_result.get("mean", 0),
-                            "dsc": dsc_result,
-                        })
+                    evaluator.add_case(case_id, dsc_result)
+                    case_result.update({"mean_dsc": dsc_result["mean"], "dsc": dsc_result})
 
                 # Jacobian 折叠检查
-                jac_result = JacobianField.check_folding(phi.squeeze())
-                results.append({
-                    "case_id": case_id,
-                    "fold_ratio": jac_result["fold_ratio"],
-                    "min_jacobian": jac_result["min_jacobian"],
-                })
+                jac_result = grid_folding_statistics(phi)
+                case_result.update(jac_result)
+                results.append(case_result)
+                print(f"  {case_id}: saved native-grid field, loss={result['loss']:.6f}", flush=True)
 
             except Exception as e:
                 errors.append({"case_id": case_id, "error": str(e)})
@@ -203,12 +224,22 @@ def run_competition_inference(
         "num_processed": len(dataset) - len(errors),
         "num_errors": len(errors),
         "deform_dir": str(deform_dir),
+        "max_iter": max_iter,
+        "target_size_dhw": list(target_size) if target_size else None,
+        "field_grid": "original fixed CT",
+        "field_units": "mm",
+        "field_components": "physical LPS x,y,z",
+        "transform": "pull: fixed CT physical point -> moving MR physical point",
+        "cases": results,
     }
 
-    if evaluator is not None:
+    if evaluator is not None and not errors:
         eval_report = evaluator.evaluate(save=True)
         evaluator.print_report(eval_report)
         summary["evaluation"] = eval_report
+    elif evaluator is not None:
+        summary["evaluation"] = None
+        summary["evaluation_status"] = "incomplete: one or more validation cases failed"
 
     # 保存汇总
     with open(output_dir / "inference_summary.json", "w") as f:
@@ -226,9 +257,11 @@ def run_competition_inference(
 
 def _compute_dsc_for_sample(
     sample: Dict[str, Any],
-    phi: torch.Tensor,
+    deformation_field: sitk.Image,
+    fixed_seg_path: Optional[str],
+    moving_seg_path: Optional[str],
     organ_labels: List[str],
-) -> Optional[Dict[str, float]]:
+) -> Dict[str, float]:
     """
     计算单个样本的 DSC（按比赛官方定义）
 
@@ -236,71 +269,43 @@ def _compute_dsc_for_sample(
     - A = 固定图像 (CT) 中某一器官的分割标签体素集合
     - B = 配准后浮动图像 (MR) 分割标签经形变场映射至 CT 空间后的体素集合
 
-    即：把 moving 分割用 phi 形变到 fixed 空间，再与 fixed 分割对比。
+    使用与正式提交完全相同的物理位移场，直接把原始 MR 标签最近邻重采样到原始 CT 网格。
 
     Args:
         sample: 数据集样本
-        phi: 变形场 (B, 3, D, H, W)
+        deformation_field: CT 网格上的 LPS 毫米位移场
         organ_labels: 器官标签列表
 
     Returns:
         各器官 DSC 值字典
     """
-    seg_moving = sample.get("seg_moving")
-    seg_fixed = sample.get("seg_fixed")
-    if seg_moving is None or seg_fixed is None:
-        return None
+    from medreglab.data import competition_masks_from_labels
+    from medreglab.evaluation import competition_case_dice
 
-    dsc_values = {}
-    for organ in organ_labels:
-        # 把 "kidney" 合并 left/right
-        if organ == "kidney":
-            sub_organs = ["kidney_left", "kidney_right"]
-        else:
-            sub_organs = [organ]
-
-        # 形变 moving 的器官 mask（合并子器官）
-        warped_combined = None
-        fixed_combined = None
-
-        for sub in sub_organs:
-            if sub not in seg_moving or sub not in seg_fixed:
-                continue
-
-            moving_mask = seg_moving[sub].unsqueeze(0).to(phi.device).float()  # [1, 1, D, H, W]
-            D, H, W = moving_mask.shape[2:]
-            if phi.shape[2:] != (D, H, W):
-                import torch.nn.functional as F
-                phi_resized = F.interpolate(phi, size=(D, H, W), mode="trilinear", align_corners=True)
-            else:
-                phi_resized = phi
-
-            warped = _apply_deformation_to_label(moving_mask, phi_resized)
-            warped = (warped > 0.5).float()
-
-            if warped_combined is None:
-                warped_combined = warped
-                fixed_combined = (seg_fixed[sub].unsqueeze(0).to(phi.device).float() > 0.5).float()
-            else:
-                warped_combined = warped_combined + warped
-                fixed_combined = fixed_combined + (seg_fixed[sub].unsqueeze(0).to(phi.device).float() > 0.5).float()
-
-        if warped_combined is not None:
-            warped_binary = (warped_combined > 0.5).float()
-            fixed_binary = (fixed_combined > 0.5).float()
-
-            intersection = (warped_binary * fixed_binary).sum().item()
-            sum_a = fixed_binary.sum().item()
-            sum_b = warped_binary.sum().item()
-            if sum_a + sum_b < 1e-6:
-                dsc_values[organ] = 0.0
-            else:
-                dsc_values[organ] = 2.0 * intersection / (sum_a + sum_b)
-
-    if dsc_values:
-        dsc_values["mean"] = float(np.mean(list(dsc_values.values())))
-
-    return dsc_values
+    if set(organ_labels) != {"liver", "spleen", "kidney"}:
+        raise ValueError("Competition DSC requires liver, spleen, and combined kidney")
+    if not fixed_seg_path or not moving_seg_path:
+        raise ValueError("Validation requires both original CT and MR segmentation files")
+    fixed_seg = sitk.ReadImage(str(fixed_seg_path))
+    moving_seg = sitk.ReadImage(str(moving_seg_path))
+    for label, image, modality in (
+        (fixed_seg, sample["fixed_sitk"], "CT"),
+        (moving_seg, sample["moving_sitk"], "MR"),
+    ):
+        if label.GetSize() != image.GetSize() or any(
+            not np.allclose(getattr(label, name)(), getattr(image, name)(), rtol=0, atol=1e-5)
+            for name in ("GetSpacing", "GetOrigin", "GetDirection")
+        ):
+            raise ValueError(f"{modality} segmentation geometry does not match its image")
+    transform = sitk.DisplacementFieldTransform(sitk.Cast(deformation_field, sitk.sitkVectorFloat64))
+    warped_seg = sitk.Resample(
+        moving_seg, sample["fixed_sitk"], transform,
+        sitk.sitkNearestNeighbor, 0, moving_seg.GetPixelID(),
+    )
+    case_id = sample["case_id"]
+    fixed_masks = competition_masks_from_labels(sitk.GetArrayViewFromImage(fixed_seg), case_id)
+    warped_masks = competition_masks_from_labels(sitk.GetArrayViewFromImage(warped_seg), case_id)
+    return competition_case_dice(fixed_masks, warped_masks)
 
 
 def _apply_deformation_to_label(
@@ -319,48 +324,31 @@ def _apply_deformation_to_label(
     Returns:
         变形后的标签
     """
-    # phi: displacement field [1, 3, D, H, W]
-    # 需要转换为 grid format for grid_sample
-
-    B, C, D, H, W = phi.shape
-    device = phi.device
-
-    # 创建标准化网格
-    grid_d = torch.linspace(-1, 1, D, device=device)
-    grid_h = torch.linspace(-1, 1, H, device=device)
-    grid_w = torch.linspace(-1, 1, W, device=device)
-    grid_d, grid_h, grid_w = torch.meshgrid(grid_d, grid_h, grid_w, indexing="ij")
-
-    # 添加位移
-    phi_norm = phi.squeeze(0).clone()  # [3, D, H, W]
-    phi_norm[0] = 2 * phi_norm[0] / D  # 归一化到 [-1, 1]
-    phi_norm[1] = 2 * phi_norm[1] / H
-    phi_norm[2] = 2 * phi_norm[2] / W
-
-    # grid: [D, H, W, 3], 每像素的目标坐标
-    grid = torch.stack([grid_d, grid_h, grid_w], dim=-1)  # [D, H, W, 3]
-    grid = grid + phi_norm.permute(1, 2, 3, 0)  # [D, H, W, 3]
-    grid = grid.unsqueeze(0)  # [1, D, H, W, 3]
-
-    # 重塑 label
-    label_flat = label.view(1, 1, D, H, W)
-
-    # 采样
-    warped = F.grid_sample(
-        label_flat,
-        grid,
-        mode=mode,
-        padding_mode="border",
-        align_corners=True,
+    if phi.ndim != 5 or phi.shape[1] != 3 or label.ndim != 5:
+        raise ValueError("Expected label [B, C, D, H, W] and phi [B, 3, D, H, W]")
+    if phi.shape[0] != label.shape[0] or phi.shape[2:] != label.shape[2:]:
+        raise ValueError("Label and displacement must share batch and spatial dimensions")
+    _, _, depth, height, width = phi.shape
+    if min(depth, height, width) < 2:
+        raise ValueError("All spatial dimensions must be at least two")
+    z, y, x = torch.meshgrid(
+        torch.linspace(-1, 1, depth, device=phi.device, dtype=phi.dtype),
+        torch.linspace(-1, 1, height, device=phi.device, dtype=phi.dtype),
+        torch.linspace(-1, 1, width, device=phi.device, dtype=phi.dtype),
+        indexing="ij",
     )
-
-    return warped
+    grid = torch.stack((x, y, z), dim=-1).unsqueeze(0)
+    scale = phi.new_tensor((2 / (width - 1), 2 / (height - 1), 2 / (depth - 1)))
+    grid = grid + phi.permute(0, 2, 3, 4, 1) * scale
+    return F.grid_sample(label, grid, mode=mode, padding_mode="zeros", align_corners=True)
 
 
 def generate_submission(
     output_dir: Union[str, Path],
     submission_dir: Union[str, Path],
     organ_labels: List[str] = None,
+    *,
+    data_root: Optional[Union[str, Path]] = None,
 ):
     """
     生成提交文件
@@ -370,47 +358,13 @@ def generate_submission(
         submission_dir: 提交文件目录
         organ_labels: 器官标签
     """
-    output_dir = Path(output_dir)
-    submission_dir = Path(submission_dir)
-    submission_dir.mkdir(parents=True, exist_ok=True)
+    if data_root is None:
+        raise ValueError("data_root is required to verify the original CT geometry")
+    if organ_labels is not None:
+        raise ValueError("organ_labels do not apply to competition ZIP packaging")
+    from experiments.package_submission import create_submission
 
-    deform_dir = output_dir / "deformation_fields"
-    if not deform_dir.exists():
-        print(f"[ERROR] Deformation fields not found: {deform_dir}")
-        return
-
-    organ_labels = organ_labels or ["liver", "spleen", "kidney"]
-
-    # 收集所有变形场文件
-    deform_files = sorted(deform_dir.glob("*_deformation_field.nii.gz"))
-    print(f"[MedRegLab] Found {len(deform_files)} deformation fields")
-
-    # 生成提交信息
-    submission_info = {
-        "submission_format": "deformation_field",
-        "version": "1.0",
-        "organ_labels": organ_labels,
-        "num_cases": len(deform_files),
-        "files": [],
-    }
-
-    for deform_file in deform_files:
-        case_id = deform_file.stem.replace("_deformation_field", "")
-        dst = submission_dir / deform_file.name
-        import shutil
-
-        shutil.copy2(deform_file, dst)
-        submission_info["files"].append({
-            "case_id": case_id,
-            "filename": deform_file.name,
-        })
-
-    # 保存提交信息
-    with open(submission_dir / "submission_info.json", "w", encoding="utf-8") as f:
-        json.dump(submission_info, f, indent=2, ensure_ascii=False)
-
-    print(f"[MedRegLab] Submission generated: {submission_dir}")
-    print(f"  Total cases: {len(deform_files)}")
+    return create_submission(output_dir, data_root, submission_dir)
 
 
 if __name__ == "__main__":
@@ -457,3 +411,5 @@ if __name__ == "__main__":
         max_iter=args.max_iter,
         save_warped=args.save_warped,
     )
+    if summary["num_errors"]:
+        raise SystemExit(1)

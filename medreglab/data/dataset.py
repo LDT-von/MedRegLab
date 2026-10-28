@@ -9,7 +9,7 @@ Competition Dataset - 比赛数据集加载器（适配实际数据格式）
     - CT/ct/img*.nii.gz
     - MR/mr/img*.nii.gz
 - 测试数据 (按发布)
-- 分割标签：单文件多标签整数 (0=背景, 1=肝, 2=脾, 3=左肾, 4=右肾)
+- 分割标签：0=背景，1=肝，2=脾，3=肾；001-008 另有标签 4 为另一侧肾。
 """
 
 import torch
@@ -27,12 +27,42 @@ ORGAN_LABELS = {
     0: "background",
     1: "liver",
     2: "spleen",
-    3: "kidney_left",
-    4: "kidney_right",
+    3: "kidney",
+    4: "kidney_001_008_second_side",
 }
 
 # 用于 DSC 计算的器官（不含背景）
-ORGANS_FOR_DSC = ["liver", "spleen", "kidney_left", "kidney_right"]
+ORGANS_FOR_DSC = ["liver", "spleen", "kidney"]
+
+
+def competition_masks_from_labels(label_array, case_id):
+    """Return all three organ masks for one multi-label image.
+
+    According to the organizer's protocol, cases 001–008 use 3 and 4 for
+    the two kidneys, whereas numbered cases 009 and later use 3 for kidney.
+    Unknown/non-numeric IDs (e.g. unpaired auxiliary images) retain both
+    kidney labels rather than silently discard a side.
+    """
+    if isinstance(label_array, torch.Tensor):
+        label_array = label_array.detach().cpu().numpy()
+    labels = np.asarray(label_array)
+    if labels.ndim != 3 or any(size == 0 for size in labels.shape) or not np.isfinite(labels).all():
+        raise ValueError("Segmentation must be a finite 3D label array")
+    if not np.equal(labels, np.floor(labels)).all():
+        raise ValueError("Segmentation labels must be integers")
+    unknown = set(np.unique(labels).tolist()) - {0, 1, 2, 3, 4}
+    if unknown:
+        raise ValueError(f"Unexpected segmentation labels: {sorted(unknown)}")
+    case_text = str(case_id)
+    known_numbered_case = case_text.isdigit()
+    both_kidneys = not known_numbered_case or 1 <= int(case_text) <= 8
+    if known_numbered_case and not both_kidneys and np.any(labels == 4):
+        raise ValueError(f"Case {case_text} has unsupported label 4 under competition rules")
+    return {
+        "liver": labels == 1,
+        "spleen": labels == 2,
+        "kidney": (labels == 3) | ((labels == 4) if both_kidneys else False),
+    }
 
 
 class CompetitionDataset(Dataset):
@@ -71,6 +101,13 @@ class CompetitionDataset(Dataset):
             ct_clip: CT 强度裁剪范围 (HU 单位)
             mr_clip_percentile: MR 强度百分位裁剪
         """
+        if intensity_norm != "percentile":
+            raise ValueError("Only percentile intensity normalization is implemented")
+        if (len(ct_clip) != 2 or not np.isfinite(ct_clip).all() or ct_clip[0] >= ct_clip[1]):
+            raise ValueError("ct_clip must contain two finite increasing values")
+        if (len(mr_clip_percentile) != 2 or not np.isfinite(mr_clip_percentile).all()
+                or not 0 <= mr_clip_percentile[0] < mr_clip_percentile[1] <= 100):
+            raise ValueError("mr_clip_percentile must contain increasing values in [0, 100]")
         self.root = Path(root)
         self.split = split
         self.transforms = transforms
@@ -100,21 +137,13 @@ class CompetitionDataset(Dataset):
             if val_dir.exists():
                 samples.extend(self._scan_paired_dir(val_dir))
             else:
-                # 没有独立验证集，从 train 划分
-                warnings.warn("No val/ directory; using train/ as val.")
-                train_dir = self.root / "train"
-                if train_dir.exists():
-                    samples.extend(self._scan_paired_dir(train_dir))
+                raise FileNotFoundError(f"Validation directory not found: {val_dir}")
         elif self.split == "test":
             test_dir = self.root / "test"
             if test_dir.exists():
                 samples.extend(self._scan_paired_dir(test_dir))
             else:
-                # 测试集尚未发布时，回退到 train 目录（仅用于生成训练变形场）
-                warnings.warn("No test/ directory; using train/ for deformation generation.")
-                train_dir = self.root / "train"
-                if train_dir.exists():
-                    samples.extend(self._scan_paired_dir(train_dir))
+                raise FileNotFoundError(f"Test directory not found: {test_dir}")
         elif self.split == "unpaired_ct":
             extra_ct_dir = self.root / "extra" / "CT" / "ct"
             if extra_ct_dir.exists():
@@ -123,6 +152,8 @@ class CompetitionDataset(Dataset):
             extra_mr_dir = self.root / "extra" / "MR" / "mr"
             if extra_mr_dir.exists():
                 samples.extend(self._scan_unpaired(extra_mr_dir, "MR"))
+        else:
+            raise ValueError(f"Unsupported data split: {self.split!r}")
 
         return samples
 
@@ -138,8 +169,7 @@ class CompetitionDataset(Dataset):
             ct_path, mr_path, seg_ct_path, seg_mr_path = self._find_paired_files(case_dir)
 
             if ct_path is None or mr_path is None:
-                warnings.warn(f"Skipping {case_id}: missing CT or MR image")
-                continue
+                raise ValueError(f"Case {case_id} is missing a CT or MR image in {case_dir}")
 
             sample = {
                 "case_id": case_id,
@@ -156,59 +186,23 @@ class CompetitionDataset(Dataset):
 
     def _find_paired_files(self, case_dir: Path):
         """查找病例目录中的配对文件（兼容两种命名）"""
-        files = {f.name: f for f in case_dir.iterdir() if f.is_file()}
-
-        ct_path = None
-        mr_path = None
-        seg_ct_path = None
-        seg_mr_path = None
-
-        # 先分离 seg 和 image
-        image_files = {n: p for n, p in files.items()
-                       if "seg" not in n.lower() and "label" not in n.lower()}
-        seg_files = {n: p for n, p in files.items()
-                     if "seg" in n.lower() or "label" in n.lower()}
-
-        # 格式 1: TCIA 风格 (img0002_tcia_CT.nii.gz / seg0002_tcia_CT.nii.gz)
-        for name, path in image_files.items():
-            if re.search(r"_CT.*\.nii(\.gz)?$", name, re.IGNORECASE):
-                ct_path = path
-            elif re.search(r"_MR.*\.nii(\.gz)?$", name, re.IGNORECASE):
-                mr_path = path
-
-        # 格式 2: {id}_ct.nii / {id}_ct-label.nii
-        if ct_path is None:
-            for name, path in image_files.items():
-                if re.search(r"_ct\.nii(\.gz)?$", name, re.IGNORECASE):
-                    ct_path = path
-                    break
-        if mr_path is None:
-            for name, path in image_files.items():
-                if re.search(r"_mr\.nii(\.gz)?$", name, re.IGNORECASE):
-                    mr_path = path
-                    break
-
-        # 格式 3: 裸文件名 ct.nii / mr.nii（官方测试集 025-032 格式）
-        if ct_path is None:
-            for name, path in image_files.items():
-                if re.match(r"^ct\.nii(\.gz)?$", name, re.IGNORECASE):
-                    ct_path = path
-                    break
-        if mr_path is None:
-            for name, path in image_files.items():
-                if re.match(r"^mr\.nii(\.gz)?$", name, re.IGNORECASE):
-                    mr_path = path
-                    break
-
-        # 分割标签
-        for name, path in seg_files.items():
-            lname = name.lower()
-            if "ct" in lname and "mr" not in lname:
-                seg_ct_path = path
-            elif "mr" in lname:
-                seg_mr_path = path
-
-        return ct_path, mr_path, seg_ct_path, seg_mr_path
+        candidates = {"ct_image": [], "mr_image": [], "ct_seg": [], "mr_seg": []}
+        for path in sorted(case_dir.iterdir()):
+            name = path.name.lower()
+            if not path.is_file() or not re.search(r"\.nii(\.gz)?$", name):
+                continue
+            is_seg = "seg" in name or "label" in name
+            ct = re.search(r"(?:^|[_-])ct(?=$|[_.-])", name) is not None
+            mr = re.search(r"(?:^|[_-])mr(?=$|[_.-])", name) is not None
+            if ct and mr:
+                raise ValueError(f"Ambiguous CT/MR file name in {case_dir}: {path.name}")
+            if ct or mr:
+                candidates[("ct" if ct else "mr") + ("_seg" if is_seg else "_image")].append(path)
+        for kind, paths in candidates.items():
+            if len(paths) > 1:
+                raise ValueError(f"Multiple {kind} candidates in {case_dir}: {[p.name for p in paths]}")
+        return tuple(candidates[kind][0] if candidates[kind] else None
+                     for kind in ("ct_image", "mr_image", "ct_seg", "mr_seg"))
 
     def _scan_unpaired(self, unpaired_dir: Path, modality: str) -> List[Dict[str, Any]]:
         """扫描未配对数据目录"""
@@ -220,16 +214,19 @@ class CompetitionDataset(Dataset):
 
             # 查找对应标签
             seg_path = None
+            name = img_path.name
+            suffix = ".nii.gz" if name.lower().endswith(".nii.gz") else img_path.suffix
+            stem = name[:-len(suffix)]
             for candidate in [
-                img_path.with_name(img_path.stem + "-label" + img_path.suffix),
-                img_path.with_name(img_path.stem + "_label" + img_path.suffix),
+                img_path.with_name(stem + "-label" + suffix),
+                img_path.with_name(stem + "_label" + suffix),
             ]:
                 if candidate.exists():
                     seg_path = candidate
                     break
 
             sample = {
-                "case_id": img_path.stem,
+                "case_id": stem,
                 "image_path": str(img_path),
                 "modality": modality,
                 "seg_path": str(seg_path) if seg_path else None,
@@ -273,14 +270,16 @@ class CompetitionDataset(Dataset):
         seg_fixed = None
         seg_moving = None
         if meta.get("seg_fixed_path") and Path(meta["seg_fixed_path"]).exists():
-            seg_fixed = self._load_segmentation(meta["seg_fixed_path"])
+            seg_fixed = self._load_segmentation(meta["seg_fixed_path"], meta["case_id"], fixed_sitk)
         if meta.get("seg_moving_path") and Path(meta["seg_moving_path"]).exists():
-            seg_moving = self._load_segmentation(meta["seg_moving_path"])
+            seg_moving = self._load_segmentation(meta["seg_moving_path"], meta["case_id"], moving_sitk)
 
-        if seg_fixed is not None or seg_moving is not None:
+        if seg_fixed is not None and seg_moving is not None:
             sample["has_segmentations"] = True
             sample["seg_fixed"] = seg_fixed  # 字典 {organ_name: tensor}
             sample["seg_moving"] = seg_moving
+        elif seg_fixed is not None or seg_moving is not None:
+            warnings.warn(f"Case {meta['case_id']} has only one segmentation; paired DSC is unavailable")
 
         # 应用变换
         if self.transforms is not None:
@@ -303,7 +302,7 @@ class CompetitionDataset(Dataset):
         }
 
         if meta.get("seg_path") and Path(meta["seg_path"]).exists():
-            seg = self._load_segmentation(meta["seg_path"])
+            seg = self._load_segmentation(meta["seg_path"], meta["case_id"], sitk_img)
             if seg is not None:
                 sample["seg"] = seg
                 sample["has_segmentations"] = True
@@ -329,6 +328,9 @@ class CompetitionDataset(Dataset):
                 arr = np.clip(arr, lo, hi)
                 if hi > lo:
                     arr = (arr - lo) / (hi - lo)
+                else:
+                    # A constant image has no intensity range to normalize.
+                    arr = np.zeros_like(arr)
                 # np.percentile 返回 float64，会把整个数组提升成 float64，
                 # 导致 CT(float32)/MR(float64) dtype 不一致，
                 # 在 grid_sample 等算子里直接报 "expected scalar type Double but found Float"。
@@ -342,38 +344,29 @@ class CompetitionDataset(Dataset):
 
         return tensor, sitk_img
 
-    def _load_segmentation(self, path: str) -> Optional[Dict[str, torch.Tensor]]:
-        """加载多标签分割并按器官拆分"""
-        try:
-            sitk_img = sitk.ReadImage(str(path))
-            arr = sitk.GetArrayFromImage(sitk_img).astype(np.int32)
-        except Exception as e:
-            warnings.warn(f"Failed to load segmentation {path}: {e}")
-            return None
-
-        # 按器官拆分为二值 mask
-        organ_masks = {}
-        for label_id, organ_name in ORGAN_LABELS.items():
-            if label_id == 0:
-                continue
-            binary = (arr == label_id).astype(np.float32)
-            if binary.sum() == 0:
-                continue
-            tensor = torch.from_numpy(binary).unsqueeze(0)  # [1, D, H, W]
-            if self.target_size is not None:
-                import torch.nn.functional as F
-
-                # nearest-neighbor 上采样
-                tensor_5d = tensor.unsqueeze(0)
-                tensor_5d = F.interpolate(
-                    tensor_5d,
-                    size=self.target_size,
-                    mode="nearest",
-                )
-                tensor = tensor_5d.squeeze(0)
-            organ_masks[organ_name] = tensor
-
-        return organ_masks if organ_masks else None
+    def _load_segmentation(self, path: str, case_id: str, reference: sitk.Image = None) -> Dict[str, torch.Tensor]:
+        """Load the three masks, preserving empty organs and spatial alignment."""
+        sitk_img = sitk.ReadImage(str(path))
+        if reference is not None:
+            if sitk_img.GetSize() != reference.GetSize():
+                raise ValueError(f"Segmentation size differs from image: {path}")
+            for getter in ("GetSpacing", "GetOrigin", "GetDirection"):
+                if not np.allclose(getattr(sitk_img, getter)(), getattr(reference, getter)(), rtol=0, atol=1e-5):
+                    raise ValueError(f"Segmentation geometry differs from image ({getter}): {path}")
+        masks = competition_masks_from_labels(sitk.GetArrayFromImage(sitk_img), case_id)
+        tensor = torch.from_numpy(np.stack([masks[organ] for organ in ORGANS_FOR_DSC]).astype(np.float32)).unsqueeze(0)
+        if self.target_size is not None and tuple(tensor.shape[2:]) != tuple(self.target_size):
+            # Match the image resize coordinates (align_corners=True), then use
+            # nearest-neighbor label sampling on the same grid.
+            import torch.nn.functional as F
+            d, h, w = self.target_size
+            grid_d, grid_h, grid_w = torch.meshgrid(
+                torch.linspace(-1, 1, d), torch.linspace(-1, 1, h),
+                torch.linspace(-1, 1, w), indexing="ij",
+            )
+            grid = torch.stack([grid_w, grid_h, grid_d], dim=-1).unsqueeze(0)
+            tensor = F.grid_sample(tensor, grid, mode="nearest", padding_mode="border", align_corners=True)
+        return {organ: tensor[0, index:index + 1] for index, organ in enumerate(ORGANS_FOR_DSC)}
 
     def _resize_tensor(
         self, tensor: torch.Tensor, target_size: Tuple[int, ...]
