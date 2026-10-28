@@ -6,34 +6,48 @@ import pytest
 import torch
 import numpy as np
 
+
 # Test imports
 def test_imports():
     """Test that all modules can be imported"""
-    from medreglab import load_model
-    from medreglab.core import ConvexAdam, RegistrationEngine
-    from medreglab.modules import IMPACTLoss, uniGradICON
-    from medreglab.models import DINORegModel
+    from medreglab import load_model, Simple3DRegistration
+    from medreglab.core import LossBuilder
+    from medreglab.models import DeformationField, JacobianField
     from medreglab.utils import RegistrationMetrics
 
 
-def test_convex_adam():
-    """Test ConvexAdam optimizer"""
-    from medreglab.core import ConvexAdam
+def test_load_model():
+    """Test the only registered model"""
+    from medreglab import load_model
 
-    optimizer = ConvexAdam(max_iter=10)
-    assert optimizer.max_iter == 10
+    model = load_model("convex_3d")
+    assert model is not None
+
+    with pytest.raises(ValueError):
+        load_model("dino_reg_mrct")
 
 
-def test_impact_loss():
-    """Test IMPACT loss"""
-    from medreglab.modules import IMPACTLoss
+def test_3d_registration():
+    """Test 3D registration produces a valid deformation field"""
+    from medreglab import load_model
 
-    loss_fn = IMPACTLoss(feature_dim=128)
-    x = torch.randn(2, 128)
-    y = torch.randn(2, 128)
+    model = load_model("convex_3d")
+    moving = torch.randn(1, 1, 16, 16, 16)
+    fixed = torch.randn(1, 1, 16, 16, 16)
 
-    loss = loss_fn(x, y)
-    assert loss.item() >= 0
+    result = model(moving, fixed)
+    assert result["phi"].shape == (1, 3, 16, 16, 16)
+    assert result["warped"].shape == (1, 1, 16, 16, 16)
+    # Simple3DRegistration 返回的 loss 是 Python float
+    assert float(result["loss"]) >= 0
+
+
+def test_loss_builder():
+    """Test LossBuilder"""
+    from medreglab.core import LossBuilder
+
+    loss_builder = LossBuilder(loss_types=["mse", "ncc"])
+    assert loss_builder is not None
 
 
 def test_metrics():
@@ -58,7 +72,8 @@ def test_deformation_field():
 
     phi = torch.randn(1, 2, 64, 64)
     jac = JacobianField.compute(phi)
-    assert jac.shape == (1, 63, 63)
+    # _compute_2d 保留 batch 与通道维: [B, 1, H-1, W-1]
+    assert jac.shape == (1, 1, 63, 63)
 
 
 if __name__ == "__main__":

@@ -1,64 +1,42 @@
 """
 MedRegLab - Medical Image Registration Laboratory
-融合 Learn2Reg 挑战赛三大冠军方案的跨模态医学图像配准工具箱
+跨模态医学图像配准工具箱（MR-CT）
 """
 
 __version__ = "0.1.0"
 
-from .core import ConvexAdam, RegistrationEngine, LossBuilder
-from .modules import IMPACTLoss, uniGradICON, ConvexRegularizer
-from .models import DINORegModel, DeformationField
+from .core import LossBuilder
+from .core.convex_3d_working import Simple3DRegistration, register_3d_simple
+from .models import DeformationField, JacobianField
 
 __all__ = [
     # Core
-    "ConvexAdam",
-    "RegistrationEngine",
     "LossBuilder",
-    # Modules
-    "IMPACTLoss",
-    "uniGradICON",
-    "ConvexRegularizer",
+    "Simple3DRegistration",
+    "register_3d_simple",
     # Models
-    "DINORegModel",
     "DeformationField",
+    "JacobianField",
 ]
 
 
-def load_model(name: str = "dino_reg_mrct"):
+def load_model(name: str = "convex_3d"):
     """
     Load a pre-configured registration model.
 
     Args:
-        name: Model name. Options: "dino_reg_mrct", "impact_mrct", "convex_mrct"
+        name: Model name. Only "convex_3d" is available:
+            - "convex_3d": 3D registration via Adam + MSE/NCC + TV
+              (per-image optimization, no learnable parameters)
 
     Returns:
-        DINORegModel: Pre-configured registration model
+        nn.Module: 模型
     """
-    from .models import DINORegModel
+    if name == "convex_3d":
+        from .core.convex_3d_working import Simple3DRegistration
+        return Simple3DRegistration(max_iter=100, lr=0.1, tv_weight=0.01, similarity="mse")
 
-    configs = {
-        "dino_reg_mrct": {
-            "feature_extractor": "dinov2",
-            "feature_dim": 1024,
-            "optimizer": "convex_adam",
-            "max_iter": 200,
-        },
-        "impact_mrct": {
-            "feature_extractor": "dinov2",
-            "feature_dim": 1024,
-            "optimizer": "convex_adam",
-            "loss_type": "impact",
-            "semantic_weight": 0.5,
-            "max_iter": 200,
-        },
-        "convex_mrct": {
-            "optimizer": "convex_adam",
-            "max_iter": 200,
-            "use_physical_priors": True,
-        },
-    }
-
-    if name not in configs:
-        raise ValueError(f"Unknown model: {name}. Available: {list(configs.keys())}")
-
-    return DINORegModel(**configs[name])
+    raise ValueError(
+        f"Unknown model: {name!r}. Available: ['convex_3d']. "
+        "DINOv2 / IMPACT variants were removed (their ConvexAdam backend was broken)."
+    )

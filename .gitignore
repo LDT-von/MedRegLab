@@ -51,8 +51,14 @@ batch_results/
 *.jpg
 !docs/*.png
 
+# Transfer artifacts (large archives)
+transfer/*.tar
+transfer/*.tar.gz
+transfer/medreglab_datasets.tar
+
 # Data
-data/
+# 仅忽略仓库根目录下的 data/，避免误伤 medreglab/data/ 代码包
+/data/
 *.nii
 *.nii.gz
 *.nrrd
@@ -70,3 +76,12 @@ Thumbs.db
 tmp/
 temp/
 .cache/
+
+# 本地环境与模型权重（不入库）
+.venv/
+activate_env.sh
+setup_env.sh
+.Datasets/
+Datasets/
+competition_outputs_all/
+outputs/
