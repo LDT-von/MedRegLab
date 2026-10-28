@@ -26,10 +26,11 @@ path (``experiments/infer_competition``) and by ``score_case``.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import SimpleITK as sitk
+import math
 
 
 class PreAlignmentError(RuntimeError):
@@ -83,6 +84,37 @@ def _initial_rigid(fixed: sitk.Image, moving: sitk.Image) -> sitk.Euler3DTransfo
     return transform
 
 
+def _metric_transform(
+    fixed: sitk.Image,
+    moving: sitk.Image,
+    transform: sitk.Transform,
+    samples: float = 0.2,
+    seed: int = 1234,
+) -> float:
+    """Score an existing CT->MR transform with Mattes mutual information.
+
+    SimpleITK's Mattes metric returns the *negated* mutual information, so a
+    **lower** value means a better match.  The transform is scored without
+    optimising it, which makes the score a pure comparison value.
+
+    The sampling seed is fixed, so repeated calls on the same pair return the
+    same number and candidate selection is reproducible.
+    """
+    fixed_f = sitk.Cast(fixed, sitk.sitkFloat32)
+    moving_f = sitk.Cast(moving, sitk.sitkFloat32)
+    metric = sitk.ImageRegistrationMethod()
+    metric.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+    metric.SetMetricSamplingStrategy(metric.RANDOM)
+    metric.SetMetricSamplingPercentage(samples, seed)
+    metric.SetInterpolator(sitk.sitkLinear)
+    metric.SetInitialTransform(transform, inPlace=False)
+    try:
+        value = metric.MetricEvaluate(fixed_f, moving_f)
+    except RuntimeError:
+        return float("inf")
+    return float(value) if math.isfinite(value) else float("inf")
+
+
 def estimate_rigid_transform(
     fixed: sitk.Image,
     moving: sitk.Image,
@@ -96,6 +128,11 @@ def estimate_rigid_transform(
     Mattes mutual information is used because CT and MR intensities are not
     linearly related.  The transform maps CT physical points to MR physical
     points, matching the pull convention of the submission format.
+
+    This is the single-candidate estimator.  :func:`estimate_rigid_transform_robust`
+    additionally compares several candidates and keeps the best one, which is
+    what the competition path uses: a gradient-descent MI search can walk away
+    from a good initialisation when the metric is flat.
     """
     fixed_f = sitk.Cast(fixed, sitk.sitkFloat32)
     moving_f = sitk.Cast(moving, sitk.sitkFloat32)
@@ -123,6 +160,105 @@ def estimate_rigid_transform(
         return registration.Execute(fixed_f, moving_f)
     except RuntimeError as error:  # pragma: no cover - defensive
         raise PreAlignmentError(f"rigid registration failed: {error}") from error
+
+
+def estimate_rigid_transform_robust(
+    fixed: sitk.Image,
+    moving: sitk.Image,
+    levels: int = 3,
+    iterations: int = 200,
+    samples: float = 0.2,
+    seed: int = 42,
+    selection_samples: float = 0.2,
+    selection_seed: int = 1234,
+) -> Tuple[sitk.Transform, dict]:
+    """Estimate a rigid CT->MR transform and keep the best of several candidates.
+
+    A single gradient-descent MI search is not reliable here.  The CT and MR
+    grids in this dataset are hundreds of millimetres apart, the metric is flat
+    far from the optimum, and the optimiser occasionally moves *away* from a
+    good initialisation (observed: a 13.9 mm initialisation becoming 41.5 mm).
+
+    The fix is to generate several independent candidates -- different
+    initialisations and two different optimisers -- and to keep the one that
+    scores best under the same metric.  The score is computed from the images
+    only; **no organ label is read**, so the selection remains a legitimate
+    image-driven step.
+
+    Returns:
+        The winning transform and a dictionary describing the candidates.
+    """
+    fixed_f = sitk.Cast(fixed, sitk.sitkFloat32)
+    moving_f = sitk.Cast(moving, sitk.sitkFloat32)
+
+    def _mi(initial, opt, iters, lev):
+        registration = sitk.ImageRegistrationMethod()
+        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+        registration.SetMetricSamplingStrategy(registration.RANDOM)
+        registration.SetMetricSamplingPercentage(samples, seed)
+        registration.SetInterpolator(sitk.sitkLinear)
+        if opt == "lbfgs":
+            registration.SetOptimizerAsLBFGSB(
+                gradientConvergenceTolerance=1e-6,
+                numberOfIterations=iters,
+                maximumNumberOfCorrections=10,
+                maximumNumberOfFunctionEvaluations=2000,
+                costFunctionConvergenceFactor=1e7,
+            )
+        else:
+            registration.SetOptimizerAsRegularStepGradientDescent(
+                learningRate=2.0, minStep=1e-4, numberOfIterations=iters,
+                relaxationFactor=0.5, gradientMagnitudeTolerance=1e-8,
+            )
+        registration.SetOptimizerScalesFromPhysicalShift()
+        shrink = [4, 2, 1][:lev]
+        registration.SetShrinkFactorsPerLevel(shrink)
+        registration.SetSmoothingSigmasPerLevel([2.0, 1.0, 0.0][:lev])
+        registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        registration.SetInitialTransform(initial, inPlace=False)
+        return registration.Execute(fixed_f, moving_f)
+
+    def _geometry_initial():
+        transform = sitk.Euler3DTransform()
+        transform.SetCenter(_geometry_center(fixed_f))
+        offset = np.asarray(_geometry_center(moving_f)) - np.asarray(_geometry_center(fixed_f))
+        transform.SetTranslation(offset.tolist())
+        return transform
+
+    candidates: List[Tuple[str, sitk.Transform]] = [
+        ("init_body", _initial_rigid(fixed_f, moving_f)),
+        ("init_geometry", _geometry_initial()),
+    ]
+    for name, initial in list(candidates):
+        try:
+            candidates.append((f"mi_body_{name}", _mi(initial, "rsgd", iterations, levels)))
+        except RuntimeError:
+            continue
+    try:
+        candidates.append(("mi_geometry_rsgd", _mi(_geometry_initial(), "rsgd", iterations, levels)))
+    except RuntimeError:
+        pass
+    try:
+        candidates.append(("mi_body_lbfgs", _mi(_initial_rigid(fixed_f, moving_f), "lbfgs", iterations, levels)))
+    except RuntimeError:
+        pass
+
+    scored = []
+    for name, transform in candidates:
+        value = _metric_transform(fixed_f, moving_f, transform, selection_samples, selection_seed)
+        scored.append({"name": name, "metric": value, "transform": transform})
+    finite = [entry for entry in scored if math.isfinite(entry["metric"])]
+    if not finite:
+        raise PreAlignmentError("no rigid candidate produced a finite metric score")
+    best = min(finite, key=lambda entry: entry["metric"])
+    report = {
+        "selected": best["name"],
+        "selected_metric": best["metric"],
+        "candidates": [
+            {"name": entry["name"], "metric": entry["metric"]} for entry in scored
+        ],
+    }
+    return best["transform"], report
 
 
 def transform_to_displacement_field(

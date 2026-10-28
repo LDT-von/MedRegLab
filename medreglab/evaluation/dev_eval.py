@@ -46,6 +46,7 @@ from medreglab.evaluation import competition_case_dice
 from medreglab.evaluation.prealign import (
     compose_rigid_and_deformable,
     estimate_rigid_transform,
+    estimate_rigid_transform_robust,
     normalize_ct,
     normalize_mr,
     resample_to_fixed_grid,
@@ -82,7 +83,7 @@ class EvalConfig:
                          # | "prealign" | "prealign_model"
 
     def validate(self) -> None:
-        if self.mode in ("model", "prealign_model"):
+        if self.mode in ("model", "prealign_model", "prealign_robust_model"):
             if not isinstance(self.max_iter, int) or isinstance(self.max_iter, bool) or self.max_iter < 1:
                 raise EvaluationError(f"{self.name}: max_iter must be a positive integer")
             if not math.isfinite(self.lr) or self.lr <= 0:
@@ -91,7 +92,7 @@ class EvalConfig:
                 raise EvaluationError(f"{self.name}: tv_weight must be finite and non-negative")
             if self.similarity not in ("mse", "ncc"):
                 raise EvaluationError(f"{self.name}: similarity must be 'mse' or 'ncc'")
-        elif self.mode not in ("zero_physical", "zero_model_identity", "prealign"):
+        elif self.mode not in ("zero_physical", "zero_model_identity", "prealign", "prealign_robust"):
             raise EvaluationError(f"{self.name}: unknown mode {self.mode!r}")
 
 
@@ -112,10 +113,23 @@ DEFAULT_CONFIGS: Tuple[EvalConfig, ...] = (
 PREALIGN_CONFIGS: Tuple[EvalConfig, ...] = (
     EvalConfig("P1_prealign", 0, 0.0, 0.0, "mse", mode="prealign"),
     EvalConfig("P2_prealign_C1", 200, 0.1, 0.01, "mse", mode="prealign_model"),
+    EvalConfig("P3_prealign_NCC", 200, 0.1, 0.01, "ncc", mode="prealign_model"),
+    EvalConfig("P4_prealign_NCC_lowtv", 200, 0.05, 0.005, "ncc", mode="prealign_model"),
+)
+
+#: The robust rigid estimator: several initialisations and two optimisers are
+#: compared and the one with the best (lowest) Mattes MI score is kept.  The
+#: single-candidate search occasionally walks away from a good initialisation.
+ROBUST_RIGID_CONFIGS: Tuple[EvalConfig, ...] = (
+    EvalConfig("R1_rigid_robust", 0, 0.0, 0.0, "mse", mode="prealign_robust"),
+    EvalConfig("R2_rigid_robust_C1", 200, 0.1, 0.01, "mse", mode="prealign_robust_model"),
+    EvalConfig("R3_rigid_robust_NCC", 200, 0.1, 0.01, "ncc", mode="prealign_robust_model"),
 )
 
 #: Every configuration the harness can run.
-ALL_CONFIGS: Tuple[EvalConfig, ...] = DEFAULT_CONFIGS + PREALIGN_CONFIGS
+ALL_CONFIGS: Tuple[EvalConfig, ...] = (
+    DEFAULT_CONFIGS + PREALIGN_CONFIGS + ROBUST_RIGID_CONFIGS
+)
 
 
 def config_by_name(name: str, configs: Sequence[EvalConfig] = ALL_CONFIGS) -> EvalConfig:
@@ -365,7 +379,7 @@ def run_configuration(
 ) -> ConfigResult:
     """Run one configuration over every case and record per-case results."""
     config.validate()
-    if config.mode in ("model", "prealign_model") and dataset is None:
+    if config.mode in ("model", "prealign_model", "prealign_robust_model") and dataset is None:
         raise EvaluationError("A dataset is required for model configurations")
 
     result = ConfigResult(name=config.name, mode=config.mode, effective={})
@@ -373,7 +387,7 @@ def run_configuration(
     field_dir.mkdir(parents=True, exist_ok=True)
 
     model = None
-    if config.mode in ("model", "prealign_model"):
+    if config.mode in ("model", "prealign_model", "prealign_robust_model"):
         from medreglab import load_model
 
         model = load_model("convex_3d")
@@ -394,6 +408,8 @@ def run_configuration(
         }
         if config.mode == "prealign_model":
             result.effective["pre_alignment"] = "rigid image-driven (Mattes MI)"
+        elif config.mode == "prealign_robust_model":
+            result.effective["pre_alignment"] = "rigid image-driven, multi-candidate MI selection"
     else:
         result.effective = {
             "mode": config.mode,
@@ -402,6 +418,8 @@ def run_configuration(
         }
         if config.mode == "prealign":
             result.effective["pre_alignment"] = "rigid image-driven (Mattes MI)"
+        elif config.mode == "prealign_robust":
+            result.effective["pre_alignment"] = "rigid image-driven, multi-candidate MI selection"
 
     case_index = {case.case_id: index for index, case in enumerate(cases)}
     for case in cases:
@@ -418,11 +436,15 @@ def run_configuration(
             elif config.mode == "zero_model_identity":
                 field = zero_model_identity_field(fixed, moving, target_size)
                 fold_stats = None
-            elif config.mode in ("prealign", "prealign_model"):
+            elif config.mode in ("prealign", "prealign_model", "prealign_robust", "prealign_robust_model"):
                 # Rigid, image-driven (no labels are read here).
-                transform = estimate_rigid_transform(fixed, moving)
+                rigid_report = None
+                if config.mode in ("prealign_robust", "prealign_robust_model"):
+                    transform, rigid_report = estimate_rigid_transform_robust(fixed, moving)
+                else:
+                    transform = estimate_rigid_transform(fixed, moving)
                 rigid_field = transform_to_displacement_field(transform, fixed)
-                if config.mode == "prealign":
+                if config.mode in ("prealign", "prealign_robust"):
                     field = rigid_field
                     fold_stats = None
                 else:
@@ -499,6 +521,8 @@ def run_configuration(
                 rigid_stats = field_statistics(rigid_field)
                 entry["rigid_magnitude_mm"] = rigid_stats["rigid_magnitude_mm"]
                 entry["rigid_mean_displacement_mm"] = rigid_stats["mean_displacement_mm"]
+            if rigid_report is not None:
+                entry["rigid_selection"] = rigid_report
             entry["elapsed_seconds"] = round(time.perf_counter() - case_start, 3)
             if device == "cuda" and torch.cuda.is_available():
                 entry["peak_gpu_gib"] = round(
