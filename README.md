@@ -148,6 +148,41 @@ float32 三分量物理位移（毫米），含义为 `p_mr = p_ct + D(p_ct)`。
 本地格式校验报告 `format_check.json` 保存在压缩包外；测试集 DSC/DSC30 由主办方计算。
 当前 Windows 工作副本的数据在仓库旁的 `../Datasets`，两条命令的 `--data` 均应改为该路径。
 
+#### 备选：基线 B 提交包（不跑配准）
+
+若配准结果在开发集上并未优于基线，可以提交**基线 B** 的位移场。
+基线 B 是模型**什么都没学到**时的退化解：缩放网格上的恒等场 `phi = 0`，
+经 `displacement_to_fixed_grid` 转到原始 CT 网格。它**不是**原始物理空间零位移——
+它已经包含了 CT 与 MR 之间的几何映射（尺寸 / spacing / origin / direction 差异），
+因此在几何不一致的病例上明显优于零位移基线 A。
+
+基线 B **不需要标签**，因此可以为隐藏测试集生成：
+
+```bash
+# 1) 生成 8 例测试集的基线 B 位移场（纯几何计算，不跑迭代、不读标签）
+python scripts/baseline_test_fields.py \
+    --data Datasets \
+    --output outputs/baseline_B_test_<RUN_ID> \
+    --split test
+
+# 2) 按同一规范打包（与上面完全相同的命令形式）
+python experiments/package_submission.py \
+    --inference outputs/baseline_B_test_<RUN_ID> \
+    --data Datasets \
+    --output outputs/submission_B_<RUN_ID>
+```
+
+生成器的输出目录布局与 `infer_competition.py` 完全一致，
+因此 `package_submission.py` 无需改动即可打包。
+任一病例失败时**不写** `inference_summary.json`，打包步骤会拒绝执行。
+
+> **交付的 C1 与 B 两个包的用途不同**：
+> C1（`outputs/submission_20261028_065511`）是**已配准**结果；
+> B（`outputs/submission_B_20261028`）是**几何对齐基线**，不含任何学习到的形变。
+> 两者都是**合法格式**的提交包，但隐藏测试集得分未知，
+> 主办方评分前无法判断哪个更高。
+
+
 > **DSC30 取整口径**：`ceil(total × 0.3)`，即 24 例取最低 **8** 例、
 > 8 例取最低 **3** 例（**向上取整**，不是向下取整）。
 > 实现见 `medreglab/evaluation/dsc_evaluator.py::DSC30_Scorer.compute`，
