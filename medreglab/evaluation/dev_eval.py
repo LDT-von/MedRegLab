@@ -430,6 +430,7 @@ def run_configuration(
             fixed = sitk.ReadImage(str(case.fixed_path))
             moving = sitk.ReadImage(str(case.moving_path))
             rigid_field = None
+            rigid_report = None
             if config.mode == "zero_physical":
                 field = zero_physical_field(fixed)
                 fold_stats = None
@@ -438,7 +439,6 @@ def run_configuration(
                 fold_stats = None
             elif config.mode in ("prealign", "prealign_model", "prealign_robust", "prealign_robust_model"):
                 # Rigid, image-driven (no labels are read here).
-                rigid_report = None
                 if config.mode in ("prealign_robust", "prealign_robust_model"):
                     transform, rigid_report = estimate_rigid_transform_robust(fixed, moving)
                 else:

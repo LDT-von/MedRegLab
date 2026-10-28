@@ -16,7 +16,13 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from medreglab.evaluation.dev_eval import ALL_CONFIGS, DEFAULT_CONFIGS, config_by_name
+from medreglab.evaluation.dev_eval import (
+    ALL_CONFIGS,
+    DEFAULT_CONFIGS,
+    PREALIGN_CONFIGS,
+    ROBUST_RIGID_CONFIGS,
+    config_by_name,
+)
 from medreglab.evaluation.prealign import (
     PreAlignmentError,
     compose_rigid_and_deformable,
@@ -155,6 +161,8 @@ def test_prealign_configurations_are_opt_in():
         "C3_tv005_lr005",
         "C4_iter100",
     ]
-    assert len(ALL_CONFIGS) == len(DEFAULT_CONFIGS) + 2
+    assert len(ALL_CONFIGS) == len(DEFAULT_CONFIGS) + len(PREALIGN_CONFIGS) + len(
+        ROBUST_RIGID_CONFIGS
+    )
     assert config_by_name("P1_prealign").mode == "prealign"
     assert config_by_name("P2_prealign_C1").mode == "prealign_model"

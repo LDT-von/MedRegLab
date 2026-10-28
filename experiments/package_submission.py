@@ -234,6 +234,12 @@ def create_submission(inference_dir, data_root, output_dir, specification=None):
         if scheme == "B_zero_model_identity"
         else "convex_3d逐例形变优化结果。"
     )
+    if scheme == "rigid_prealign":
+        scheme_note = (
+            "刚性预对齐：仅用CT与MR影像做Mattes互信息刚性搜索（多候选，"
+            "按同一MI指标选优），不含任何器官标签；结果栅格化为原始CT网格上的"
+            "物理位移场，未叠加形变优化。"
+        )
     (output_dir / "README.txt").write_text(
         "正式规范格式包：submission.zip\n"
         f"方案：{scheme}；病例：025-032；沿用已完成的8例推理结果。\n"

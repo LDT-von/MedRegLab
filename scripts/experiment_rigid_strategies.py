@@ -208,11 +208,18 @@ def main() -> int:
         results = list(pool.map(_score_case, cases))
     results.sort(key=lambda r: r["case_id"])
 
-    names = [r["name"] for r in results[0]["rows"]]
+    names: list[str] = []
+    for res in results:
+        for row in res["rows"]:
+            if row["name"] not in names:
+                names.append(row["name"])
     print(f"{'case':6s} " + " ".join(f"{n:>15s}" for n in names) + "   pick(metric)  pick->dsc  best")
     for res in results:
         by = {r["name"]: r for r in res["rows"]}
-        cells = " ".join(f"{by[n]['dsc']:.3f}/{by[n]['err_mm']:5.0f}mm" for n in names)
+        cells = " ".join(
+            f"{by[n]['dsc']:.3f}/{by[n]['err_mm']:5.0f}mm" if n in by else " " * 15
+            for n in names
+        )
         print(f"{res['case_id']:6s} {cells}   {res['picked_by_metric']:>13s} "
               f"{res['picked_by_metric_dsc']:.3f}   {res['best_dsc']:.3f}({res['best_dsc_name']})")
     print()
