@@ -11,6 +11,20 @@ from .dsc_evaluator import (
     dice_per_organ,
     competition_case_dice,
 )
+from .dev_eval import (
+    DEFAULT_CONFIGS,
+    ConfigResult,
+    EvalConfig,
+    EvaluationError,
+    build_comparison,
+    collect_development_cases,
+    config_by_name,
+    preflight,
+    run_configurations,
+    score_case,
+    zero_model_identity_field,
+    zero_physical_field,
+)
 
 __all__ = [
     "DSC_Scorer",
@@ -20,4 +34,16 @@ __all__ = [
     "dice_coefficient",
     "dice_per_organ",
     "competition_case_dice",
+    "DEFAULT_CONFIGS",
+    "ConfigResult",
+    "EvalConfig",
+    "EvaluationError",
+    "build_comparison",
+    "collect_development_cases",
+    "config_by_name",
+    "preflight",
+    "run_configurations",
+    "score_case",
+    "zero_model_identity_field",
+    "zero_physical_field",
 ]

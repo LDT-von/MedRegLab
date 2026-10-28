@@ -316,10 +316,23 @@ DSC 计算走 `infer_competition._apply_deformation_to_label`，
 > ⚠️ **当前状态**：该缺陷在 `6933cfe` 中**已修复**
 > （两处 warp 均改为 `z, y, x = torch.meshgrid(...)` +
 > `torch.stack((x, y, z), dim=-1)`，除数 `2/(width-1), 2/(height-1), 2/(depth-1)`）。
-> 但 `336047c` 引入的 `test_label_warp_axis_order`
-> 在上游重写时**被删除**，`6933cfe` 的测试套件中目前**未见逐轴验证**。
-> 建议补一条**非对称** mask 的逐轴回归测试，见
-> [EVIDENCE_BASELINE.md §6](EVIDENCE_BASELINE.md)。
+> `336047c` 引入的 `test_label_warp_axis_order` 虽被上游重写时删除，
+> 但**逐轴验证能力已由上游新用例覆盖**：
+> `tests/test_inference_contract.py::test_label_warp_identity_and_axis_translations`
+> 用逐体素递增的非对称 label 与非立方网格 4×5×6，
+> 断言 identity 与 x/y/z 三方向平移；
+> `tests/test_train_pipeline.py::test_label_warp_identity_translation_and_outside_use_xyz_axes`
+> 覆盖 `train_competition._warp_label` 的同类行为。
+> 实测把错误版 warp 代入这些断言后**全部失败**，
+> 即可确认它们能捕获该缺陷。详见
+> [EVIDENCE_BASELINE.md §3.5](EVIDENCE_BASELINE.md)。
+
+**本轮补充的物理空间回归测试**：
+`tests/test_inference_contract.py::test_native_dsc_resamples_each_physical_axis_to_the_expected_voxel`
+把原先只覆盖 **x 方向**的物理空间评分测试扩展为 x/y/z 三个方向，
+并覆盖**立方等距网格**、**非立方非等距 spacing**、**非单位方向矩阵**三种几何，
+使用**非对称**合成标签，断言**预期重采样体素位置**，
+同时断言沿**错误**物理轴拉取**不能**复现解剖。
 
 ---
 
@@ -381,7 +394,7 @@ git 远端 `https://github.com/LDT-von/MedRegLab.git` 保留了初始提交 `67b
 | 3D 配准 `convex_3d`（GPU） | 64³ 用时 1.7 s，loss 0.0217 |
 | 完整推理 `infer_competition.py` | 8/8 成功，0 错误 |
 | 变形场输出 | 合法 3 分量 NIfTI，`[64,64,64,3]` float32 |
-| 数据增强 + DSC/DSC30 评估器 | 正常，DSC30 取最低 30% 病例均值 |
+| 数据增强 + DSC/DSC30 评估器 | 正常，DSC30 取最低 30% 病例均值（病例数**向上取整**：`ceil(total×0.3)`，24 例→8 例，8 例→3 例） |
 | `train_competition.py` 训练 | 1 epoch 跑通 24 例，产出 history.json |
 | `selfcheck.sh` | **9/9 全部通过** |
 

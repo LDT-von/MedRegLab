@@ -18,6 +18,157 @@ from experiments.infer_competition import (
 )
 from medreglab.data import CompetitionDataset
 
+# LPS direction matrices: identity and a 90 degree rotation about the LPS z axis.
+_DIRECTION_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+_DIRECTION_ROTATED_Z = (0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+# Synthetic anatomy: label value -> CT voxel index (x, y, z). The positions are
+# deliberately asymmetric and spread out so that swapping two axes or
+# mis-mapping a physical direction cannot accidentally reproduce them.
+_SYNTHETIC_ORGANS = {
+    1: (4, 1, 2),
+    2: (1, 3, 3),
+    3: (3, 4, 1),
+    4: (2, 2, 4),
+}
+
+
+def _label_image(size_xyz, spacing, origin, direction, marks):
+    """Build a label image from {(x, y, z): label_value}."""
+    array = np.zeros(tuple(reversed(size_xyz)), dtype=np.uint8)
+    for (x, y, z), value in marks.items():
+        array[z, y, x] = value
+    image = sitk.GetImageFromArray(array)
+    image.SetSpacing(spacing)
+    image.SetOrigin(origin)
+    image.SetDirection(direction)
+    return image
+
+
+def _constant_displacement_field(reference, displacement_xyz):
+    """A constant LPS displacement field on the reference image's grid."""
+    array = np.zeros((*reversed(reference.GetSize()), 3), dtype=np.float32)
+    array[..., 0] = displacement_xyz[0]
+    array[..., 1] = displacement_xyz[1]
+    array[..., 2] = displacement_xyz[2]
+    field = sitk.GetImageFromArray(array, isVector=True)
+    field.CopyInformation(reference)
+    return field
+
+
+def test_native_dsc_resamples_each_physical_axis_to_the_expected_voxel(tmp_path, monkeypatch):
+    """The physical scoring path must pull MR labels along x, y and z correctly.
+
+    Each case places identical anatomy in CT and in a twice-finer MR grid whose
+    origin is offset by a known physical displacement. The MR organ therefore
+    sits exactly where the pull transform is expected to sample it, so the
+    warped MR label must land back on the original CT voxel. The three
+    geometries cover a cubic isotropic grid, a non-cubic anisotropic grid and
+    a non-cubic grid with a non-identity direction matrix.
+    """
+    monkeypatch.chdir(tmp_path)
+    base_origin = np.array((11.0, -7.0, 42.0))
+    geometries = {
+        "cubic_isotropic": ((5, 5, 5), (1.0, 1.0, 1.0), _DIRECTION_IDENTITY),
+        "non_cubic_anisotropic": ((7, 6, 5), (1.5, 2.0, 3.0), _DIRECTION_IDENTITY),
+        "non_cubic_rotated": ((7, 6, 5), (1.5, 2.0, 3.0), _DIRECTION_ROTATED_Z),
+    }
+    for name, (size_xyz, spacing, direction) in geometries.items():
+        ct_marks = {index: label for label, index in _SYNTHETIC_ORGANS.items()}
+        fixed_label = _label_image(size_xyz, spacing, tuple(base_origin), direction, ct_marks)
+        mr_size = tuple(2 * extent for extent in size_xyz)
+        mr_spacing = tuple(extent / 2 for extent in spacing)
+
+        for axis_name, component in (("x", 0), ("y", 1), ("z", 2)):
+            displacement = np.zeros(3)
+            displacement[component] = spacing[component]
+            mr_origin = tuple(base_origin + displacement)
+            mr_marks = {
+                tuple(2 * coordinate for coordinate in index): label
+                for label, index in _SYNTHETIC_ORGANS.items()
+            }
+            moving_label = _label_image(mr_size, mr_spacing, mr_origin, direction, mr_marks)
+
+            fixed_path = f"fixed-{name}-{axis_name}.nii.gz"
+            moving_path = f"moving-{name}-{axis_name}.nii.gz"
+            sitk.WriteImage(fixed_label, fixed_path)
+            sitk.WriteImage(moving_label, moving_path)
+
+            field = _constant_displacement_field(fixed_label, displacement)
+            sample = {
+                "case_id": "001",
+                "fixed_sitk": fixed_label,
+                "moving_sitk": moving_label,
+            }
+            result = _compute_dsc_for_sample(
+                sample, field, fixed_path, moving_path, ["liver", "spleen", "kidney"]
+            )
+            # Every organ returns to its original CT voxel, so every DSC is 1.0.
+            assert result["liver"] == pytest.approx(1.0), f"{name}/{axis_name} liver"
+            assert result["spleen"] == pytest.approx(1.0), f"{name}/{axis_name} spleen"
+            assert result["kidney"] == pytest.approx(1.0), f"{name}/{axis_name} kidney"
+            assert result["mean"] == pytest.approx(1.0), f"{name}/{axis_name} mean"
+
+            # The warped MR label must land on the exact expected CT voxel.
+            transform = sitk.DisplacementFieldTransform(sitk.Cast(field, sitk.sitkVectorFloat64))
+            warped = sitk.Resample(
+                moving_label, fixed_label, transform,
+                sitk.sitkNearestNeighbor, 0, moving_label.GetPixelID(),
+            )
+            warped_array = sitk.GetArrayViewFromImage(warped)
+            for label, expected_index in _SYNTHETIC_ORGANS.items():
+                found = np.argwhere(warped_array == label)
+                assert len(found) == 1, f"{name}/{axis_name} label {label} count"
+                actual = (int(found[0][2]), int(found[0][1]), int(found[0][0]))
+                assert actual == expected_index, f"{name}/{axis_name} label {label}"
+
+            # A pull along the wrong physical axis must not reproduce the anatomy.
+            wrong = np.zeros(3)
+            wrong[(component + 1) % 3] = spacing[(component + 1) % 3]
+            wrong_field = _constant_displacement_field(fixed_label, wrong)
+            wrong_transform = sitk.DisplacementFieldTransform(
+                sitk.Cast(wrong_field, sitk.sitkVectorFloat64)
+            )
+            wrong_warped = sitk.Resample(
+                moving_label, fixed_label, wrong_transform,
+                sitk.sitkNearestNeighbor, 0, moving_label.GetPixelID(),
+            )
+            wrong_array = sitk.GetArrayViewFromImage(wrong_warped)
+            wrong_found = np.argwhere(wrong_array == 1)
+            wrong_index = (
+                (int(wrong_found[0][2]), int(wrong_found[0][1]), int(wrong_found[0][0]))
+                if len(wrong_found) else None
+            )
+            assert wrong_index != _SYNTHETIC_ORGANS[1], (
+                f"{name}/{axis_name}: wrong axis reproduced the anatomy"
+            )
+
+
+def test_native_dsc_rejects_geometry_mismatch(tmp_path, monkeypatch):
+    """A segmentation whose geometry differs from its image must be rejected."""
+    monkeypatch.chdir(tmp_path)
+    fixed = _label_image((5, 6, 7), (1.5, 2.0, 3.0), (11.0, -7.0, 42.0), _DIRECTION_IDENTITY, {(1, 1, 1): 1})
+    moving = _label_image((5, 6, 7), (1.5, 2.0, 3.0), (11.0, -7.0, 42.0), _DIRECTION_IDENTITY, {(1, 1, 1): 1})
+    sitk.WriteImage(fixed, "fixed-label.nii.gz")
+    sitk.WriteImage(moving, "moving-label.nii.gz")
+    field = _constant_displacement_field(fixed, (0.0, 0.0, 0.0))
+
+    wrong_spacing = _label_image((5, 6, 7), (1.0, 2.0, 3.0), (11.0, -7.0, 42.0), _DIRECTION_IDENTITY, {(1, 1, 1): 1})
+    sitk.WriteImage(wrong_spacing, "wrong-label.nii.gz")
+    sample = {"case_id": "001", "fixed_sitk": fixed, "moving_sitk": moving}
+    with pytest.raises(ValueError, match="geometry does not match"):
+        _compute_dsc_for_sample(
+            sample, field, "wrong-label.nii.gz", "moving-label.nii.gz",
+            ["liver", "spleen", "kidney"],
+        )
+
+    with pytest.raises(ValueError, match="liver, spleen, and combined kidney"):
+        _compute_dsc_for_sample(
+            sample, field, "fixed-label.nii.gz", "moving-label.nii.gz",
+            ["liver", "spleen"],
+        )
+
+
 
 def test_label_warp_identity_and_axis_translations():
     label = torch.arange(4 * 5 * 6, dtype=torch.float32).reshape(1, 1, 4, 5, 6)

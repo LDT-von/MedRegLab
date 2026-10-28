@@ -230,11 +230,41 @@ identity 场下正确实现必然给出 Dice = 1.0，因此任何 < 1 的结果
 **仍待确认：**
 
 - `336047c` 引入的回归测试 `tests/test_medreglab.py::test_label_warp_axis_order`
-  在上游 `6933cfe` 中**被删除**（该文件在 `6933cfe` 里仍有其他 6 个测试，
-  但轴序那条不在其中）。当前 `6933cfe` 的测试集中在
-  `tests/test_field_regression.py` 等文件，**未见逐轴验证形变方向的用例**。
-  → 见 §6 的建议。
+  在上游 `6933cfe` 中**被同名文件重写时删除了**。
+  但**逐轴验证并未消失**：上游 `6933cfe` 现有
+  `tests/test_inference_contract.py::test_label_warp_identity_and_axis_translations`
+  （以及 `tests/test_train_pipeline.py::test_label_warp_identity_translation_and_outside_use_xyz_axes`）
+  已覆盖 identity 与 x/y/z 三个方向的平移。
+  → 已用**错误版** warp 实测：现有用例会在这 3 个方向上**全部失败**，
+  即可捕获该缺陷。详见 §3.5。
 - 历史 0.396 / 0.400 无产物，永久无法复核。
+
+### 3.5 现有逐轴测试的实测验证（更正此前说法）
+
+此前本文档写过「当前 `6933cfe` 未见逐轴验证形变方向的用例」，
+**该说法有误，已更正**。实际情况：
+
+- `tests/test_inference_contract.py::test_label_warp_identity_and_axis_translations`
+  用 `torch.arange(4*5*6).reshape(1,1,4,5,6)` 作为 label
+  （**每个体素取值不同**，非对称、非立方网格 4×5×6），
+  断言 identity 场下输出不变，并分别对
+  `phi` 的第 0/1/2 分量施加 1 个体素平移，
+  断言输出沿 x/y/z 三个方向整体平移一格。
+- `tests/test_train_pipeline.py::test_label_warp_identity_translation_and_outside_use_xyz_axes`
+  覆盖 `train_competition._warp_label` 的同类行为。
+
+**实测**：把 §3.1 的**错误版** warp 替换进同一断言后，
+identity 断言与 3 个方向的平移断言**全部失败**（4/4），
+即现有用例**确实能捕获该缺陷**。
+
+因此准确表述应为：
+
+> 旧用例**名字** `test_label_warp_axis_order` 已被删除，
+> 但逐轴验证的**能力**由上游新用例覆盖，且经验证能捕获该缺陷。
+
+> 关于 §3.2 脚注的补充：脚注针对的是**「用居中立方体对称 mask 造测试」**
+> 这种写法会漏掉 bug；而上游现有用例用的是
+> **逐体素递增的非对称 label + 非立方网格 4×5×6**，因此不受该问题影响。
 
 ---
 
@@ -304,15 +334,16 @@ identity 场下正确实现必然给出 Dice = 1.0，因此任何 < 1 的结果
 编号 ≥ 009 的病例若出现标签 4 会**直接报错**。
 
 > ⚠️ **待核实**：`009`–`024` 的实际标签取值需在运行前用只读脚本确认
-> （见 §5.6 的 `list_labels.py`）。若发现 `009+` 存在标签 4，
+> （见 §5.6 的 `scripts/dev_eval_preflight.py`，它会打印每个病例的
+> `ct_labels` / `mr_labels` 直方图）。若发现 `009+` 存在标签 4，
 > 当前 `competition_masks_from_labels` 会抛
 > `Case {id} has unsupported label 4 under competition rules`，
 > 需要先澄清规则再跑。
 
 **建议的固定评估集合**（若 24 例全部带标签且标签分布合规）：
 **全部 24 例**，即 `Datasets/train/001 … 024`。
-理由：样本量最大，且 `DSC30` 取最低 30% 时
-24 例 → 7 例（`floor(0.3*24)=7`），8 例 → 2 例。
+理由：样本量最大，且 `DSC30` 取最低 30% 时**向上取整**，
+24 例 → `ceil(24×0.3)=8` 例，8 例 → `ceil(8×0.3)=3` 例。
 样本更多时 DSC30 更稳定。
 
 ### 5.4 评估口径（必须与提交包一致）
@@ -327,11 +358,18 @@ identity 场下正确实现必然给出 Dice = 1.0，因此任何 < 1 的结果
   中，**CT 侧该器官为空 → 该项记 1.0**（含 warped 侧出现假阳性的情形）。
   注意这与历史实现（记 0）不同。
 - **DSC 公式**：`2|A∩B| / (|A|+|B|)`，**不加平滑项**。
-- **DSC30**：所有评估病例 mean DSC 中**最低 30%** 的均值。
-- **identity 基线**：零位移场。这**不是**现成 CLI 选项，
-  需要一个只做零形变的路径 —— 方案见 §5.6 的 `identity_baseline.py`。
-  它同样走原始 CT 网格 + `sitk.Resample`，
-  以保证与配准组**完全同口径**。
+- **DSC30**：所有评估病例 mean DSC 中**最低 30%** 的均值，
+  病例数**向上取整**（`ceil(total × 0.3)`，见
+  `medreglab/evaluation/dsc_evaluator.py::DSC30_Scorer.compute`）。
+  24 例 → 8 例；8 例 → 3 例。
+- **两个不同的 identity 基线**（不可混称，详见 §5.6）：  - **A. 原始物理空间零位移** `D(p) = 0`：在原始 CT 网格上，
+    直接把 MR 重采样到 CT 网格且**不做任何位移**。
+  - **B. 模型缩放网格初始 `phi=0` 经原始空间转换后的映射**：
+    模型在缩放网格上以恒等场初始化，该恒等场经
+    `displacement_to_fixed_grid` 转换到原始 CT 网格后，
+    **通常不等于零**，因为它还包含了 CT 与 MR 之间的几何配准项
+    （尺寸 / spacing / origin / direction 的差异）。
+  - 二者在 CT 与 MR 几何完全相同时才一致。
 
 ### 5.5 预先确定的配置清单
 
@@ -341,134 +379,175 @@ identity 场下正确实现必然给出 Dice = 1.0，因此任何 < 1 的结果
 `seed` 只影响数据增强顺序；`6933cfe` 的 `configs/competition_config.yaml`
 已把增强全部关闭，故本轮**无增强**，结果应可复现。
 
-| # | 配置 | `max_iter` | `lr` | `tv_weight` | `similarity` | 目的 |
+| # | 配置名 | `max_iter` | `lr` | `tv_weight` | `similarity` | 目的 |
 |---|---|---|---|---|---|---|
-| C0 | identity | 0（零位移场） | — | — | — | 下界基线 |
-| C1 | 当前配置 | 200 | 0.1 | 0.01 | mse | 与已生成提交包**同参数**，可对照 |
-| C2 | 更强 TV | 200 | 0.1 | **0.05** | mse | 观察折叠率是否下降、DSC 是否变化 |
-| C3 | 更强 TV + 更低 lr | 200 | **0.05** | **0.05** | mse | 降低步长，减小过冲 |
-| C4 | 更少迭代 | **100** | 0.1 | 0.01 | mse | 迭代数是否过冲 |
+| A | `A_zero_physical` | — | — | — | — | 基线 A：原始物理空间零位移 `D(p)=0` |
+| B | `B_zero_model_identity` | — | — | — | — | 基线 B：模型 `phi=0` 转原始空间后的映射 |
+| C1 | `C1_current` | 200 | 0.1 | 0.01 | mse | 当前配置，与已生成提交包**同参数**，可对照 |
+| C2 | `C2_tv005` | 200 | 0.1 | **0.05** | mse | 观察折叠率是否下降、DSC 是否变化 |
+| C3 | `C3_tv005_lr005` | 200 | **0.05** | **0.05** | mse | 降低步长，减小过冲 |
+| C4 | `C4_iter100` | **100** | 0.1 | 0.01 | mse | 迭代数是否过冲 |
 
-> 只做 **5 个配置**，且**在运行前固定**，不根据结果追加。
+> 只做 **6 个配置**（A、B 为基线），且**在运行前固定**，不根据结果追加。
 > ⚠️ **不假设**「TV 越大 DSC 越高」——这是待检验的假设，不是前提。
 > 同理，**不假设**折叠率下降就一定 DSC 上升。
 > 折叠率与 DSC 的关系由本次实验给出答案。
 >
-> ⚠️ `tv_weight`/`lr` **当前没有 CLI 参数**，
-> 需要一个薄封装脚本或复用 `train_competition.py` 的配置路径。
-> §5.6 给出两种做法，建议用「薄封装脚本」，不改动仓库现有 CLI。
+> A 与 B **不可混称为同一个 identity**：当 CT 与 MR 的尺寸、spacing、
+> origin、direction 不同时，B 通常不为零。
+> `scripts/dev_eval_preflight.py` 会列出几何不同的病例。
+>
+> 这些配置已在 `medreglab/evaluation/dev_eval.py::DEFAULT_CONFIGS` 中固定，
+> 由 `scripts/dev_eval_run.py` 驱动；工具会从模型对象读回
+> `max_iter` / `lr` / `tv_weight` / `similarity` 存入报告，
+> 防止参数被静默忽略。
 
-### 5.6 需要新增的脚本（**尚未创建**，本次不运行）
+### 5.6 已实现的评估工具（本次已落地，**未对真实病例运行**）
 
-| 脚本 | 作用 | 是否触及患者数据 |
-|---|---|---|
-| `scripts/list_labels.py` | 只读打印每个病例的标签取值、图像尺寸、几何信息 | 只读 |
-| `scripts/identity_baseline.py` | 生成零位移场，按原始 CT 网格算 DSC/DSC30 | 是（只读） |
-| `scripts/run_eval_configs.py` | 按 §5.5 表格逐配置跑同一批病例，输出对比表 | 是（只读） |
+| 文件 | 作用 |
+|---|---|
+| `medreglab/evaluation/dev_eval.py` | 评估核心：配置定义、病例收集、两个基线、评分、逐例配对对比 |
+| `scripts/dev_eval_preflight.py` | **只读**盘点：病例数、几何、标签直方图（不跑配准） |
+| `scripts/dev_eval_run.py` | 逐配置跑同一批病例，输出 `manifest.json` + `comparison.json` |
+| `tests/test_dev_eval_harness.py` | 用**合成数据**验证上述工具的端到端流程（9 项） |
 
-> 这三个脚本是**方案的一部分**，本次**不创建、不运行**，
-> 等你确认后再落地。
+关键行为：
+
+- **两个基线严格区分**（`dev_eval.py` 顶部有说明）：
+  - `A_zero_physical`：原始 CT 网格上的 `D(p) = 0`；
+  - `B_zero_model_identity`：模型缩放网格 `phi = 0` 经
+    `displacement_to_fixed_grid` 转换后的物理映射。
+    该映射**包含 CT 与 MR 之间的几何项**（尺寸 / spacing / origin / direction），
+    因此在几何不同的病例上**通常不为零**。
+    合成测试 `test_zero_physical_and_model_identity_baselines_differ`
+    断言了这一点：几何不同时 B ≠ 0，几何相同时 B ≈ 0。
+- **记录实际生效参数**：配置写入模型后，再从模型对象读回
+  `max_iter` / `lr` / `tv_weight` / `similarity` 存入报告，
+  参数被忽略会立刻暴露。
+- **失败即报错**：缺病例、缺标签、几何不匹配、运行失败都会抛
+  `EvaluationError` 并终止，**不会**生成看似完整的汇总。
+- **拒绝测试集**：`--split test` 直接退出（exit 2）。
+- **拒绝覆盖**：输出目录非空时报错。
 
 ### 5.7 预期输出路径
 
 ```
-outputs/eval_<RUN_ID>/
-├── label_inventory.json          # list_labels.py 产物
-├── identity/
-│   ├── eval_results/eval_report.json
-│   └── per_case.json
-├── c1_current/                   # max_iter=200 lr=0.1 tv=0.01 mse
+outputs/dev_eval_<RUN_ID>/
+├── manifest.json               # 病例清单、几何、输入/标签哈希、配置、git commit、是否 dirty
+├── comparison.json             # 逐例配对对比表 + 汇总
+├── A_zero_physical/
 │   ├── deformation_fields/<case>_deformation_field.nii.gz
-│   ├── eval_results/eval_report.json
 │   └── per_case.json
-├── c2_tv005/                     # tv=0.05
-├── c3_tv005_lr005/               # tv=0.05 lr=0.05
-├── c4_iter100/                   # max_iter=100
-└── comparison.json               # 逐例配对对比表 + 折叠率汇总
+├── B_zero_model_identity/
+├── C1_current/                 # max_iter=200 lr=0.1 tv=0.01 mse
+├── C2_tv005/                   # tv=0.05
+├── C3_tv005_lr005/             # tv=0.05 lr=0.05
+└── C4_iter100/                 # max_iter=100
 ```
 
-`comparison.json` 建议字段：
-
-```json
-{
-  "case_ids": ["001", "..."],
-  "configs": {
-    "identity":  {"mean_dsc": 0.0, "dsc30": 0.0, "fold_ratio": null, "per_case": {}},
-    "c1_current":{"mean_dsc": 0.0, "dsc30": 0.0, "fold_ratio": 0.0, "per_case": {}}
-  },
-  "per_case_delta_vs_identity": {"c1_current": {"001": 0.0}}
-}
-```
-
-### 5.8 判定规则（预先写死，避免事后挑结果）
+### 5.8 判定规则（预先约定）
 
 1. **主判据**：原始 CT 网格上的 mean DSC 与 DSC30。
-2. **诊断判据**：`fold_ratio`、`min_jacobian`。
+2. **诊断判据**：`fold_ratio`、`min_jacobian`（**不是**官方得分项）。
 3. 只有当某配置在 mean DSC **和** DSC30 上都**不低于 C1**，
-   且 `fold_ratio` 明显低于 C1 时，才考虑把它用于生成新提交包。
-4. 若各配置 DSC 差异 < 0.01，判定为「**在当前模型能力下无实质差异**」，
-   结论转为「需要换相似性度量/多尺度，而不是调 TV」。
+   且 `fold_ratio` 明显低于 C1 时，才考虑用它生成新提交包。
+4. **「差异小于 0.01」只是一个预先约定的工程阈值**，
+   用于决定「是否值得进一步细分排查」，
+   **不能**单凭它断言「模型之间无实质差异」，
+   更**不能**断言「必须更换相似性度量/多尺度方法」。
+   任何结论都必须基于**逐例配对差值**（`per_case_deltas_vs_A_zero_physical`）
+   与逐例结果本身来陈述，而不是汇总均值之差。
 5. **不得**用测试集 `025–032` 的隐藏标签做任何选择。
+6. 即使在开发集上选出了配置，也只能称为**开发集结果**，
+   **不能**称为独立验证。
 
-### 5.9 预期命令（**本次不执行**）
+### 5.9 实际可执行命令（**本次未对 `Datasets/` 执行**）
 
 ```bash
 cd /data1/MedRegLab &&
 source scripts/activate_medreg_env.sh &&
 
 MEDREG_RUN_ID="$(date +%Y%m%d_%H%M%S)" &&
-MEDREG_EVAL="outputs/eval_${MEDREG_RUN_ID}" &&
+MEDREG_EVAL="outputs/dev_eval_${MEDREG_RUN_ID}" &&
 
-# 1) 只读盘点标签与几何（不跑配准）
-python scripts/list_labels.py --data Datasets --output "${MEDREG_EVAL}/label_inventory.json" &&
+# 1) 只读盘点：病例数、几何差异、标签直方图（不跑配准）
+python scripts/dev_eval_preflight.py \
+    --data Datasets --split train \
+    --output "${MEDREG_EVAL}/preflight.json" &&
 
-# 2) identity 基线（零位移场，原始 CT 网格）
-python scripts/identity_baseline.py \
-    --data Datasets --output "${MEDREG_EVAL}/identity" &&
-
-# 3) 逐配置跑同一批病例
-python scripts/run_eval_configs.py \
+# 2) 逐配置跑同一批病例（自动生成 manifest.json 与 comparison.json）
+python scripts/dev_eval_run.py \
     --data Datasets \
     --output "${MEDREG_EVAL}" \
-    --configs c1_current c2_tv005 c3_tv005_lr005 c4_iter100 &&
+    --target_size 128 128 128 &&
 
-# 4) 汇总对比
-python scripts/compare_eval_configs.py \
-    --eval "${MEDREG_EVAL}" \
-    --output "${MEDREG_EVAL}/comparison.json" &&
-
-printf '评估结果目录：%s\n' "${MEDREG_EVAL}"
+printf '开发集评估目录：%s\n' "${MEDREG_EVAL}"
 ```
 
-> 上面的脚本名是**建议**。落地时需要先确认 §5.6 的实现方式
-> （尤其是「零位移场 identity 基线」在当前代码里没有现成入口）。
+只跑部分配置（调试用）：
+
+```bash
+python scripts/dev_eval_run.py --data Datasets --output "${MEDREG_EVAL}" \
+    --configs A_zero_physical B_zero_model_identity C1_current
+```
+
+跑前自检（不碰数据）：
+
+```bash
+python -m pytest tests/test_dev_eval_harness.py tests/test_evaluation_protocol.py \
+    tests/test_inference_contract.py -q
+```
 
 ---
 
-## 6. 建议补的回归测试
+## 6. 回归测试现状（更正）
 
 上游 `6933cfe` 删除了 `336047c` 引入的
-`tests/test_medreglab.py::test_label_warp_axis_order`。
-建议在 `6933cfe` 基础上重新补一条**逐轴**验证：
-对**非对称** mask 分别沿 x/y/z 施加已知位移，
-断言形变后 mask 的质心位移方向正确。
+`tests/test_medreglab.py::test_label_warp_axis_order`，
+**但逐轴验证能力已由上游新用例覆盖**，无需重复补测：
 
-> 注意：用**居中立方体** mask 的测试会漏掉这个 bug（见 §3.2 的脚注），
-> 必须用非对称形状。
+| 覆盖点 | 上游现有用例 |
+|---|---|
+| `infer_competition._apply_deformation_to_label` 的 identity + x/y/z 平移 | `tests/test_inference_contract.py::test_label_warp_identity_and_axis_translations` |
+| `train_competition._warp_label` 的 identity + x/y/z 平移 | `tests/test_train_pipeline.py::test_label_warp_identity_translation_and_outside_use_xyz_axes` |
+| 物理空间评分用 MR 标签 + CT→MR 物理位移场 | `tests/test_evaluation_protocol.py::test_native_dsc_uses_mr_labels_and_ct_to_mr_physical_field` |
+
+已实测确认：把错误版 warp 代入现有断言，identity 与三个方向**全部失败**（§3.5）。
+
+**物理空间**那一层原有用例
+`test_native_dsc_uses_mr_labels_and_ct_to_mr_physical_field`
+只覆盖 **x 方向**，且用的是**全 0 / 单轴平移**的简单标签。
+本轮已补齐覆盖，见 §7。
 
 ---
 
-## 7. 证据边界小结
+## 7. 本轮补充的测试
+
+| 测试 | 覆盖内容 |
+|---|---|
+| `tests/test_evaluation_protocol.py::test_dsc30_rounds_case_count_up` | DSC30 病例数**向上取整**：24 例 → 8 例，8 例 → 3 例，7 例 → 3 例，1 例 → 1 例；并断言 floor 口径（7 例）会给出不同结果 |
+| `tests/test_inference_contract.py::test_native_dsc_resamples_each_physical_axis_to_the_expected_voxel` | 物理空间评分的 x/y/z 三个方向；立方等距网格、非立方非等距 spacing、非单位方向矩阵；用**非对称**合成标签并断言**预期重采样体素位置**；并断言沿错误物理轴拉取**不能**复现解剖 |
+| `tests/test_inference_contract.py::test_native_dsc_rejects_geometry_mismatch` | 分割几何与图像不一致时报错；器官集合不完整时报错 |
+| `tests/test_dev_eval_harness.py`（9 项） | 开发集评估工具的端到端合成测试：病例收集与哈希、几何差异检测、两个基线的区分、逐例配对对比、拒绝覆盖非空目录、缺标签时报错、DSC30 取整 |
+
+---
+
+## 8. 证据边界小结
 
 | 结论 | 证据强度 |
 |---|---|
 | 轴序缺陷真实存在，且在立方体网格上也会把 identity DSC 打到接近 0 | **已复算验证**（§3.2） |
 | `6933cfe` 已修复轴序，并把 DSC 评分迁到原始 CT 网格 | **已核对代码**（§3.4） |
+| 上游现有逐轴测试能捕获该缺陷 | **已实测验证**（§3.5） |
 | 历史文档记录过 0.396 / 0.400 两个数字 | **已核对文档**（E1） |
 | 0.396 / 0.400 的具体测量条件（病例 ID、逐例结果、日志） | **待核实**（无产物） |
 | 0.396 / 0.400 来自 `Datasets/train` 前若干例的 64³ 缩放网格 | 文档自述，**待核实** |
+| 历史代码在缺少 `val/` 时回退到 `train/`，且历史配置 `val_dir` 指向 `train` | **已核对代码与配置**（E6/E8） |
 | 0.396 与 0.400 相差 0.004 | **算术事实** |
 | 「0.15 → 0.40」这一对修复前后数字 | **待核实**（机制方向已复算支持） |
 | 历史数字与当前提交包可比 | **否**（评分空间/器官集合/双肾/空器官规则均不同，§2.5） |
+| 0.396 / 0.400 是独立验证集或测试集结果 | **否**（无产物 + 无独立 val 划分，§2.4） |
 | 当前折叠率 4.1%–11.2%、min_jacobian 低至 -102.6 | **已核对本轮运行产物**（§4） |
+| 开发集评估工具的端到端流程可用 | **已用合成数据验证**（§7） |
 | 增大 TV 是否提高 DSC | **未知**，由 §5 实验检验 |
+| 「差异 < 0.01」能否断言模型无实质差异 | **不能**（仅为预先约定的工程阈值，§5.8 第 4 条） |

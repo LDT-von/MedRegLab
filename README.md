@@ -146,6 +146,11 @@ float32 三分量物理位移（毫米），含义为 `p_mr = p_ct + D(p_ct)`。
 本地格式校验报告 `format_check.json` 保存在压缩包外；测试集 DSC/DSC30 由主办方计算。
 当前 Windows 工作副本的数据在仓库旁的 `../Datasets`，两条命令的 `--data` 均应改为该路径。
 
+> **DSC30 取整口径**：`ceil(total × 0.3)`，即 24 例取最低 **8** 例、
+> 8 例取最低 **3** 例（**向上取整**，不是向下取整）。
+> 实现见 `medreglab/evaluation/dsc_evaluator.py::DSC30_Scorer.compute`，
+> 回归测试见 `tests/test_evaluation_protocol.py::test_dsc30_rounds_case_count_up`。
+
 ### 单轮逐例诊断
 
 ```bash
@@ -158,6 +163,46 @@ python experiments/train_competition.py \
 > 诊断脚本不保存网络 checkpoint，且默认不计算验证分数。若指定独立的 `--val`，
 > 其结果是缩放网格上的诊断分数；原始空间验证请使用推理入口的 `--split val`。
 > 缺少独立验证集时不会自动回退到训练集。
+
+### 开发集评估工具（配置对比）
+
+用于在**同一批**开发集病例上比较若干**事先固定**的注册配置，
+并与两个不同的基线对照。详见
+[docs/EVIDENCE_BASELINE.md §5](docs/EVIDENCE_BASELINE.md)。
+
+```bash
+# 1) 只读盘点：病例数、几何差异、标签直方图（不跑配准）
+python scripts/dev_eval_preflight.py --data Datasets --split train
+
+# 2) 逐配置跑同一批病例，输出 manifest.json + comparison.json
+python scripts/dev_eval_run.py --data Datasets --output outputs/dev_eval_<RUN_ID>
+```
+
+对比的配置固定为：
+
+| 配置 | 含义 |
+|---|---|
+| `A_zero_physical` | 基线 A：原始物理空间零位移 `D(p) = 0` |
+| `B_zero_model_identity` | 基线 B：模型缩放网格 `phi=0` 转原始空间后的映射 |
+| `C1_current` | `max_iter=200, lr=0.1, tv=0.01, mse`（当前配置） |
+| `C2_tv005` | `tv=0.05` |
+| `C3_tv005_lr005` | `tv=0.05, lr=0.05` |
+| `C4_iter100` | `max_iter=100` |
+
+要点：
+
+- **A 与 B 不是同一个东西**。CT 与 MR 的尺寸 / spacing / origin / direction
+  不同时，B 通常不为零（它包含了两者之间的几何映射）。
+- **DSC30 向上取整**：`ceil(total × 0.3)`，24 例 → 8 例，8 例 → 3 例。
+- 评分在**原始 CT 网格**上做，三个器官（liver / spleen / 合并双肾），
+  CT 侧空器官记 1.0，与提交口径一致。
+- 报告保留逐例结果、病例 ID、输入与标签 SHA256、配置、**实际生效参数**、
+  代码 commit、运行错误与汇总；缺病例 / 缺标签 / 几何不匹配 / 运行失败
+  会**直接报错**，不生成看似完整的汇总。
+- `--split test` 会被拒绝：测试集 `025–032` 不用于配置选择。
+- **结果只能称为开发集结果**。在开发集上选配置**不构成**独立验证。
+- 「差异 < 0.01」只是**预先约定的工程阈值**，
+  不能单凭它断言模型之间无实质差异；结论应基于**逐例配对差值**。
 
 ---
 

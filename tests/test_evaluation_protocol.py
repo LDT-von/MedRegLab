@@ -1,5 +1,7 @@
 """Synthetic, label-only checks of the supplied competition scoring rules."""
 
+import math
+
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -67,6 +69,36 @@ def test_dsc30_uses_lowest_three_of_eight_and_no_invented_composite():
         evaluator.add_case("0", {"liver": 1, "spleen": 1, "kidney": 1})
     with pytest.raises(ValueError, match="Missing organ"):
         evaluator.add_case("new", {"liver": 1})
+
+
+def test_dsc30_rounds_case_count_up():
+    """DSC30 takes ceil(total * 0.3) cases: 8 -> 3, 24 -> 8."""
+    assert math.ceil(8 * 0.3) == 3
+    assert math.ceil(24 * 0.3) == 8
+
+    # 24 cases: the lowest 8 are averaged, not the lowest 7.
+    evaluator = CompetitionEvaluator()
+    scores = [round(0.02 * index, 4) for index in range(24)]
+    for index, score in enumerate(scores):
+        evaluator.add_case(f"{index:03d}", {"liver": score, "spleen": score, "kidney": score})
+    result = evaluator.evaluate(save=False)
+    assert result["DSC30"]["num_worst"] == 8
+    assert result["DSC30"]["total"] == 24
+    assert result["DSC30"]["worst_cases"] == [f"{index:03d}" for index in range(8)]
+    assert result["DSC30"]["dsc30"] == pytest.approx(float(np.mean(scores[:8])))
+    # A floor-based count would have averaged only 7 cases.
+    assert result["DSC30"]["dsc30"] != pytest.approx(float(np.mean(scores[:7])))
+
+    # A single case still yields one worst case rather than an empty selection.
+    single = CompetitionEvaluator()
+    single.add_case("000", {"liver": 0.5, "spleen": 0.5, "kidney": 0.5})
+    assert single.evaluate(save=False)["DSC30"]["num_worst"] == 1
+
+    # Seven cases: ceil(7 * 0.3) == 3.
+    seven = CompetitionEvaluator()
+    for index, score in enumerate([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]):
+        seven.add_case(str(index), {"liver": score, "spleen": score, "kidney": score})
+    assert seven.evaluate(save=False)["DSC30"]["num_worst"] == 3
 
 
 def test_missing_val_or_test_does_not_fall_back_to_training(tmp_path):
