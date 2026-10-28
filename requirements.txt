@@ -1,6 +1,8 @@
 # Core Dependencies
-torch>=1.10.0
-torchvision>=0.11.0
+# 注意：RTX 5090 是 sm_120 (Blackwell)，必须 torch>=2.7 且用 cu128 构建。
+# base 环境里的 torch 2.6.0+cu124 无法在本机执行任何 CUDA kernel。
+torch>=2.7.0
+torchvision>=0.20.0
 
 # Medical Image Processing
 monai>=0.9.0
@@ -15,12 +17,6 @@ scikit-image>=0.19.0
 # Utilities
 tqdm>=4.62.0
 pyyaml>=6.0
-einops>=0.4.0
-paramiko>=2.10.0
-scp>=0.14.0
-
-# Optional: For DINO features
-timm>=0.5.0
 
 # Development
 pytest>=7.0.0

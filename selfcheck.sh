@@ -90,7 +90,44 @@ print("  仅 convex_3d 可用，移除的模型正确报错")
 PY
 [ $? -eq 0 ] && ok "模型注册表" || bad "模型注册表"
 
-echo "=== 8. 数据去重校验 ==="
+echo "=== 8. 训练链路 (1 epoch, 真实数据) ==="
+rm -rf outputs/_selfcheck_train
+.venv/bin/python - <<'PY'
+import warnings, sys; warnings.filterwarnings("ignore")
+sys.path.insert(0, "experiments")
+from train_competition import train_competition
+train_competition(
+    config={
+        "model": "convex_3d",
+        "batch_size": 1,
+        "num_epochs": 1,
+        "learning_rate": 1e-4,
+        "target_size": [32, 32, 32],
+        "loss_types": ["mse", "ncc"],
+        "loss_weights": {"mse": 1.0, "ncc": 1.0},
+        "tv_weight": 0.05,
+        "jacobian_weight": 0.01,
+        "elastic_deform": True,
+        "random_flip": True,
+        "intensity_aug": True,
+        "save_interval": 100,
+        "max_grad_norm": 5.0,
+        "use_scheduler": False,
+        "organ_labels": ["liver", "spleen", "kidney"],
+        "seed": 42,
+    },
+    train_data_dir="Datasets",
+    val_data_dir=None,
+    output_dir="outputs/_selfcheck_train",
+)
+import json, os
+assert os.path.exists("outputs/_selfcheck_train/logs/train_history.json"), "missing history"
+print("  训练跑通，history.json 已生成")
+PY
+[ $? -eq 0 ] && ok "训练链路" || bad "训练链路"
+rm -rf outputs/_selfcheck_train
+
+echo "=== 9. 数据去重校验 ==="
 .venv/bin/python - <<'PY'
 import os, re, hashlib
 root = "Datasets"
@@ -107,7 +144,7 @@ assert dups == 0
 PY
 [ $? -eq 0 ] && ok "无残留重复文件" || bad "去重"
 
-echo "=== 9. 无残留 Windows 路径 ==="
+echo "=== 10. 无残留 Windows 路径 ==="
 if grep -rn 'E:\\\\MedRegLab\|E:/MedRegLab' --include="*.py" --include="*.yaml" \
      . 2>/dev/null | grep -v '\.venv/' | grep -v '^\./docs/'; then
     bad "仍有 Windows 绝对路径"

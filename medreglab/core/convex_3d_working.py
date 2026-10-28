@@ -1,7 +1,9 @@
 """
-Simple 3D ConvexAdam-style registration - 极简版，使用 autograd
+Simple 3D registration - 极简版，使用 autograd
 
-这是最干净可靠的实现：直接对 phi 参数求梯度。
+这是最干净可靠的实现：直接对 phi 参数求梯度（Adam on phi）。
+注意：与 Learn2Reg 的凸优化 ConvexAdam 不是同一个东西，
+这里没有凸性保证，也没有可学习参数。
 """
 
 import torch

@@ -101,6 +101,11 @@ export HF_HUB_DISABLE_XET=1   # 关键
 `activate_env.sh` 已自动设置 `HF_ENDPOINT`、`HF_HOME`（指向仓库内 `.cache/`）
 与 `HF_HUB_DISABLE_XET=1`。权重放在 `/data1` 分区，避免占满根分区。
 
+> **注意**：清理后仓库已不再包含任何 DINOv2 / IMPACT 相关代码
+> （见第 6 节），因此 timm 与 HF 权重目前**不是运行必需**，
+> 保留它们只是为了将来若要重建 DINO-Reg 方案时不必重新下载。
+> 完整依赖里 `timm` 仍是可选依赖。
+
 ---
 
 ## 6. 本次修复的问题
@@ -115,8 +120,11 @@ export HF_HUB_DISABLE_XET=1   # 关键
 |---|---|
 | `configs/competition_config.yaml` | `data.train_dir` 等改为 `Datasets/train` 等相对路径 |
 | `smoke_test_train.py` | `DATA_ROOT` / `OUTPUT_DIR` 改为 `Path(__file__).parent` 相对路径 |
-| `experiments/train_impact.py` | `CT_DIR` 改为 `REPO_ROOT / "Datasets" / "train"`；`--output` 默认值同理 |
 | `medreglab/data/dataset.py` | 仅文档注释中的路径 |
+
+> 6.2 – 6.6 记录的是 **DINOv2 / IMPACT 相关代码**（`dinov2_extractor.py`、
+> `train_impact.py`）的问题。这些代码已在第 7 节清理中删除，
+> 此处保留记录，便于将来重建该方案时避免重蹈覆辙。
 
 ### 6.2 DINOv2 `img_size` 不匹配（真实功能 bug）
 
@@ -173,37 +181,173 @@ DINOv2 的 patch embed 是 3 通道 `nn.Conv2d`，
 
 `tests/test_medreglab.py` 断言 `jac.shape == (1, 63, 63)`，
 但 `JacobianField._compute_2d` 实际返回 `[B, 1, H-1, W-1]`。
-实现与所有调用方（`train_competition.py`、`train_impact.py`、`eval.py`、
-`infer_competition.py`，均只用 `.mean()/.var()/.sum()`）都是自洽的，
+实现与所有调用方（`train_competition.py`、`infer_competition.py`，
+均只用 `.mean()/.var()/.sum()`）都是自洽的，
 因此修正的是**测试断言**，不是实现。
+
+### 6.8 `ConvexAdam._init_identity_field` 缺 batch 维与 `requires_grad`
+
+返回的是 `(3, D, H, W)`，但下游全部按 `(B, 3, D, H, W)` 使用；
+且张量 `requires_grad=False`，`torch.autograd.grad` 必然失败：
+
+```
+RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+```
+
+同时 `_warp_image` 里的 `phi.permute(0, 1, 3, 4, 2)` 只在 5D 成立，
+4D 输入会报 `permute(sparse_coo): input.dim() = 3 is not equal to len(dims) = 4`。
+
+**后果**：`ConvexAdam` 在 2D 与 3D 下均完全不可用。
+
+### 6.9 `DINOv2Extractor.forward` 只支持 2D
+
+输入 5D 时 `x.repeat(1, 3, 1, 1)` 报
+`Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor`。
+
+**后果**：`DINORegModel` 家族（`dino_reg_mrct` / `impact_mrct` / `convex_mrct`）
+在 2D 与 3D 下**全部崩溃**。注意 `convex_mrct` 名字有误导性——
+它同样挂了 `DINOv2Extractor`，并非纯 ConvexAdam。
+
+### 6.10 `infer_competition.py` 默认模型指向已崩溃的 `dino_reg_mrct`
+
+原默认 `model_name="dino_reg_mrct"`，实测 **8/8 样例全部失败**，
+一个变形场都没产出。
+
+### 6.11 `uniGradICON` 通道数不匹配
+
+`GradientComputationModule.matching_layer` 期望拼接后 512 通道
+（`feature_dim * 2`），但 `MultiScaleFeatureExtractor` 末层输出只有 256 通道：
+
+```
+RuntimeError: Given groups=1, weight of size [256, 512, 1, 1],
+expected input[1, 256, 16, 16] to have 512 channels
+```
+
+### 6.12 `train_impact.py` 的对比损失恒为 0
+
+`ContrastiveHead` 计算 `cross_entropy(similarity[B, B], labels)`，
+`batch_size=1` 时 softmax 只有一个类别，loss 恒等于 0。
+实测 `{'semantic': 0.000163, 'contrastive': 0.0, 'adversarial': 0.0}`。
+所谓"训练"实际只优化了 semantic encoder 的 MSE 项。
+
+### 6.13 数据增强 `_apply_displacement` 的 grid 维度错误
+
+网格被构造成 `[3, D, H, W]` 后接 `permute(0, 3, 4, 1, 2)`（5 维），
+必然报 `input.dim() = 4 is not equal to len(dims) = 5`。
+
+**修复**：改为与 `convex_3d_working.Simple3DRegistration._warp` 完全一致的
+约定（`F.grid_sample` 3D 要求 grid 为 `[B, D, H, W, 3]`，最后一维是 `(x, y, z)`）。
+修复后与 `convex_3d._warp` 逐元素比对，三个轴向的最大误差均为 `0.00e+00`。
+
+### 6.14 CT/MR 数据 dtype 不一致
+
+`np.percentile` 返回 `float64`，把 MR 数组整体提升为 float64，
+而 CT 仍是 float32。两者在 `grid_sample` 中混合会报：
+
+```
+RuntimeError: expected scalar type Double but found Float
+```
+
+**修复**：MR 归一化后显式 `arr.astype(np.float32)`；
+`_apply_displacement` 中额外做 `warped_grid.to(dtype=image.dtype)` 兜底。
+
+### 6.15 `DataLoader` 无法 collate SimpleITK 图像对象
+
+`CompetitionDataset` 的 sample 里带 `fixed_sitk` / `moving_sitk`，
+默认 collate 报 `found <class 'SimpleITK.SimpleITK.Image'>`。
+训练循环并不需要这些元信息。
+
+**修复**：`experiments/train_competition.py` 增加 `_collate_training`，
+丢弃 SITK 对象并把 `seg_moving` 统一到 `segmentations`（供 DSC 计算用）。
+
+### 6.16 训练/验证阶段张量维度
+
+数据集每样本已是 `[1, C, D, H, W]`，`DataLoader` 再加一维会变成 6D，
+而 `Simple3DRegistration.forward` 期望 5D。
+`infer_competition.py` 原本已有 `squeeze(0)` 处理，训练侧缺失。
+**修复**：训练与验证阶段统一压回 5D。
+
+### 6.17 `convex_3d` 无可学习参数导致的训练崩溃
+
+`torch.optim.Adam(model.parameters())` 遇空参数列表会抛
+`ValueError: optimizer got an empty parameter list`；
+验证阶段的 `torch.no_grad()` 也会让 `convex_3d` 内部的 autograd 优化失效。
+
+**修复**：训练脚本按 `trainable_params` 是否为空决定是否建优化器与反向传播；
+验证阶段改用 `torch.enable_grad()`；无参数时不再保存空 checkpoint。
 
 ---
 
-## 7. 已验证可用的功能
+## 7. 清理记录：删除了什么、为什么
+
+### 7.1 已删除的代码（均因不可用或无人引用）
+
+| 文件 | 原因 |
+|---|---|
+| `medreglab/core/convex_optimizer.py` | `ConvexAdam` 2D/3D 均崩溃（6.8） |
+| `medreglab/core/registration_engine.py` | 依赖 `ConvexAdam`，3D/2D 均崩溃 |
+| `medreglab/models/reg_model.py` | `DINORegModel` 全家族崩溃（6.9、6.10） |
+| `medreglab/models/dinov2_extractor.py` | 仅 2D 可用，且 3D 崩溃 |
+| `medreglab/modules/impact_loss.py` | 仅服务于已删除的 `DINORegModel` |
+| `medreglab/modules/gradicon.py` | 通道数 bug，且无任何预设会用到 |
+| `medreglab/modules/convex_regularizer.py` | 仅服务于已删除的路径 |
+| `medreglab/utils/visualization.py` | 仅服务于已删除的 `train.py`/`eval.py`/`infer.py` |
+| `experiments/train.py`、`eval.py` | `ImportError`（引用不存在的 `RegistrationDataset`） |
+| `experiments/infer.py` | 仅支持单对文件，且默认模型已崩溃 |
+| `experiments/train_impact.py` | 对比损失恒为 0，训练信号退化（6.12） |
+| `configs/l2r2021_convex.yaml`、`l2r2023_dino_reg.yaml`、`test_config.yaml` | 指向不存在的 `data/l2r*` 路径，无人引用 |
+
+### 7.2 已删除的产物
+
+- `competition_outputs_all/`（2.3 GB，24 例变形场 + warped 图，Windows 时代产物，路径写死 `E:\MedRegLab`）
+- `outputs/train_smoke*`（4.4 MB 调试残留）
+- 各处 `__pycache__`、`.pytest_cache`、`medreglab.egg-info`、空的 `medreglab/modules/`
+
+### 7.3 清理后现状
+
+**唯一可用模型是 `convex_3d`**（`Simple3DRegistration`）：
+逐图优化（Adam on `phi`）+ MSE/NCC + TV 正则，**没有可学习参数**。
+
+`load_model()` 现在只接受 `"convex_3d"`，其余名字会抛 `ValueError`。
+`train_competition.py` / `infer_competition.py` 的默认模型已同步改为 `convex_3d`。
+
+### 7.4 备份
+
+删除前已打包两份备份（均在 `/data1`）：
+
+- `/data1/MedRegLab_code_backup_20261028.tar.gz` — 全部代码（含未提交的修复）
+- `/data1/MedRegLab_untracked_backup_20261028.tar.gz` — 未纳入 git 的新文件
+
+git 远端 `https://github.com/LDT-von/MedRegLab.git` 保留了初始提交 `67b7fc4`。
+
+---
+
+## 8. 已验证可用的功能
 
 | 检查 | 结果 |
 |---|---|
-| `pytest tests/` | **5 passed** |
+| `pytest tests/` | **6 passed** |
 | `import medreglab` | OK，`__all__` 全部可导入 |
-| 数据集 train split | 24 例配对，CT=fixed / MR=moving，标签可加载 |
+| `medreglab.modules` | 已删除，import 正确报 `ModuleNotFoundError` |
+| `load_model("convex_3d")` | OK；`load_model("dino_reg_mrct")` 正确抛 `ValueError` |
+| 数据集 train split | 24 例配对，CT=fixed / MR=moving，标签可加载，dtype 一致 |
 | 数据集 test split | 8 例（025–032） |
 | 数据集 unpaired_ct / unpaired_mr | 50 / 40 例 |
 | 3D 配准 `convex_3d`（GPU） | 64³ 用时 1.7 s，loss 0.0217 |
 | 完整推理 `infer_competition.py` | 8/8 成功，0 错误 |
 | 变形场输出 | 合法 3 分量 NIfTI，`[64,64,64,3]` float32 |
 | 数据增强 + DSC/DSC30 评估器 | 正常，DSC30 取最低 30% 病例均值 |
-| `train_impact.py` 训练 | 1 epoch 完成，产出 checkpoint + history.json |
+| `train_competition.py` 训练 | 1 epoch 跑通 24 例，产出 history.json |
+| `selfcheck.sh` | **9/9 全部通过** |
 
 **注意**：`convex_3d`（`Simple3DRegistration`）**没有可学习参数**，
-它是逐图优化（Adam on `phi`），因此**不能**用于 `train_competition.py`
-（该脚本会构造 `torch.optim.Adam(model.parameters())`，
-空参数列表会抛 `ValueError: optimizer got an empty parameter list`）。
-`train_competition.py` 需用 `dino_reg_mrct` / `impact_mrct`。
-`train_impact.py` 只训练 IMPACT 的 558,464 个参数（DINOv2 冻结）。
+它是逐图优化（Adam on `phi`）。因此 `train_competition.py` 在该模型下
+只做「配准 + 评估」，不做梯度更新，也不会保存 checkpoint——
+这是预期行为，不是错误。
 
 ---
 
-## 8. 数据去重记录
+## 9. 数据去重记录
 
 `Datasets/` 下共 572 个文件，其中 **278 个是浏览器下载重名副本**
 （`X(1).nii.gz` 与 `X.nii.gz` 字节完全相同，md5 一致）。
@@ -214,20 +358,25 @@ DINOv2 的 patch embed 是 3 通道 `nn.Conv2d`，
 
 ---
 
-## 9. 目录结构
+## 10. 目录结构
 
 ```
 /data1/MedRegLab/
 ├── .venv/                 # Python 3.12 + torch 2.10.0+cu128（约 7 GB）
 ├── activate_env.sh        # 激活环境
 ├── setup_env.sh           # 从零重建环境
+├── selfcheck.sh           # 9 项交付前自检
 ├── Datasets/              # train(24) / test(8) / extra(50 CT + 40 MR)，已去重
-├── competition_outputs_all/  # 历史推理产物（变形场 1.8 GB + warped 457 MB）
 ├── medreglab/             # 核心包
-├── experiments/           # train_competition / train_impact / infer_competition / eval
-├── configs/               # competition_config.yaml 等
+│   ├── core/              # convex_3d_working.py / loss_builder.py
+│   ├── models/            # deformation_field.py
+│   ├── data/              # dataset.py / transforms.py / sampler.py
+│   ├── evaluation/        # dsc_evaluator.py
+│   └── utils/             # metrics.py / io_utils.py
+├── experiments/           # train_competition.py / infer_competition.py
+├── configs/               # competition_config.yaml
 ├── outputs/               # 运行产物（gitignore）
-└── tests/                 # 5 个测试
+└── tests/                 # 6 个测试
 ```
 
 `.venv/`、`.cache/`、`Datasets/`、`outputs/`、`competition_outputs_all/`
