@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 import torch  # noqa: E402
 
 from medreglab.evaluation.dev_eval import (  # noqa: E402
-    DEFAULT_CONFIGS,
+    ALL_CONFIGS,
     EvaluationError,
     build_comparison,
     collect_development_cases,
@@ -43,7 +43,7 @@ def main() -> int:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
-    configs = DEFAULT_CONFIGS
+    configs = ALL_CONFIGS
     if args.configs:
         configs = tuple(config_by_name(n) for n in args.configs)
 

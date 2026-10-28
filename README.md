@@ -68,7 +68,9 @@ MedRegLab/
 │   │   ├── transforms.py          # 数据增强
 │   │   └── sampler.py             # 采样器
 │   ├── evaluation/
-│   │   └── dsc_evaluator.py       # DSC / DSC30 评估
+│   │   ├── dsc_evaluator.py       # DSC / DSC30 评估
+│   │   ├── dev_eval.py            # 开发集评估（配置对比）
+│   │   └── prealign.py            # 图像驱动的刚性预对齐
 │   └── utils/
 │       ├── metrics.py             # 评估指标
 │       └── io_utils.py            # IO 工具
@@ -188,6 +190,13 @@ python scripts/dev_eval_run.py --data Datasets --output outputs/dev_eval_<RUN_ID
 | `C2_tv005` | `tv=0.05` |
 | `C3_tv005_lr005` | `tv=0.05, lr=0.05` |
 | `C4_iter100` | `max_iter=100` |
+
+另有两个**可选**的刚性预对齐配置（默认不在固定集合内，需显式 `--configs` 指定）：
+
+| 配置 | 含义 |
+|---|---|
+| `P1_prealign` | 仅刚性配准（图像驱动 Mattes MI，不读标签） |
+| `P2_prealign_C1` | 刚性预对齐后，再按 C1 参数做形变优化 |
 
 要点：
 

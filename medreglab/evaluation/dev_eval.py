@@ -43,6 +43,14 @@ import torch
 
 from medreglab.data import CompetitionDataset, competition_masks_from_labels
 from medreglab.evaluation import competition_case_dice
+from medreglab.evaluation.prealign import (
+    compose_rigid_and_deformable,
+    estimate_rigid_transform,
+    normalize_ct,
+    normalize_mr,
+    resample_to_fixed_grid,
+    transform_to_displacement_field,
+)
 from medreglab.utils.submission import displacement_to_fixed_grid, grid_folding_statistics
 
 ORGANS = ("liver", "spleen", "kidney")
@@ -71,9 +79,10 @@ class EvalConfig:
     tv_weight: float
     similarity: str
     mode: str = "model"  # "model" | "zero_physical" | "zero_model_identity"
+                         # | "prealign" | "prealign_model"
 
     def validate(self) -> None:
-        if self.mode == "model":
+        if self.mode in ("model", "prealign_model"):
             if not isinstance(self.max_iter, int) or isinstance(self.max_iter, bool) or self.max_iter < 1:
                 raise EvaluationError(f"{self.name}: max_iter must be a positive integer")
             if not math.isfinite(self.lr) or self.lr <= 0:
@@ -82,7 +91,7 @@ class EvalConfig:
                 raise EvaluationError(f"{self.name}: tv_weight must be finite and non-negative")
             if self.similarity not in ("mse", "ncc"):
                 raise EvaluationError(f"{self.name}: similarity must be 'mse' or 'ncc'")
-        elif self.mode not in ("zero_physical", "zero_model_identity"):
+        elif self.mode not in ("zero_physical", "zero_model_identity", "prealign"):
             raise EvaluationError(f"{self.name}: unknown mode {self.mode!r}")
 
 
@@ -97,8 +106,19 @@ DEFAULT_CONFIGS: Tuple[EvalConfig, ...] = (
     EvalConfig("C4_iter100", 100, 0.1, 0.01, "mse", mode="model"),
 )
 
+#: Configurations that add an image-driven rigid pre-alignment in front of the
+#: deformable optimizer.  ``P1_prealign`` is rigid only; ``P2_prealign_C1``
+#: runs the same C1 deformable settings on the rigidly aligned pair.
+PREALIGN_CONFIGS: Tuple[EvalConfig, ...] = (
+    EvalConfig("P1_prealign", 0, 0.0, 0.0, "mse", mode="prealign"),
+    EvalConfig("P2_prealign_C1", 200, 0.1, 0.01, "mse", mode="prealign_model"),
+)
 
-def config_by_name(name: str, configs: Sequence[EvalConfig] = DEFAULT_CONFIGS) -> EvalConfig:
+#: Every configuration the harness can run.
+ALL_CONFIGS: Tuple[EvalConfig, ...] = DEFAULT_CONFIGS + PREALIGN_CONFIGS
+
+
+def config_by_name(name: str, configs: Sequence[EvalConfig] = ALL_CONFIGS) -> EvalConfig:
     for config in configs:
         if config.name == name:
             return config
@@ -345,7 +365,7 @@ def run_configuration(
 ) -> ConfigResult:
     """Run one configuration over every case and record per-case results."""
     config.validate()
-    if config.mode == "model" and dataset is None:
+    if config.mode in ("model", "prealign_model") and dataset is None:
         raise EvaluationError("A dataset is required for model configurations")
 
     result = ConfigResult(name=config.name, mode=config.mode, effective={})
@@ -353,7 +373,7 @@ def run_configuration(
     field_dir.mkdir(parents=True, exist_ok=True)
 
     model = None
-    if config.mode == "model":
+    if config.mode in ("model", "prealign_model"):
         from medreglab import load_model
 
         model = load_model("convex_3d")
@@ -372,12 +392,16 @@ def run_configuration(
             "target_size_dhw": [int(v) for v in target_size],
             "device": device,
         }
+        if config.mode == "prealign_model":
+            result.effective["pre_alignment"] = "rigid image-driven (Mattes MI)"
     else:
         result.effective = {
             "mode": config.mode,
             "target_size_dhw": [int(v) for v in target_size],
             "device": device,
         }
+        if config.mode == "prealign":
+            result.effective["pre_alignment"] = "rigid image-driven (Mattes MI)"
 
     case_index = {case.case_id: index for index, case in enumerate(cases)}
     for case in cases:
@@ -387,12 +411,48 @@ def run_configuration(
         try:
             fixed = sitk.ReadImage(str(case.fixed_path))
             moving = sitk.ReadImage(str(case.moving_path))
+            rigid_field = None
             if config.mode == "zero_physical":
                 field = zero_physical_field(fixed)
                 fold_stats = None
             elif config.mode == "zero_model_identity":
                 field = zero_model_identity_field(fixed, moving, target_size)
                 fold_stats = None
+            elif config.mode in ("prealign", "prealign_model"):
+                # Rigid, image-driven (no labels are read here).
+                transform = estimate_rigid_transform(fixed, moving)
+                rigid_field = transform_to_displacement_field(transform, fixed)
+                if config.mode == "prealign":
+                    field = rigid_field
+                    fold_stats = None
+                else:
+                    # Deformable refinement on the rigidly aligned pair.
+                    aligned = resample_to_fixed_grid(moving, fixed, transform)
+                    fixed_array = normalize_ct(sitk.GetArrayViewFromImage(fixed))
+                    moving_array = normalize_mr(sitk.GetArrayViewFromImage(aligned))
+                    fixed_tensor = torch.from_numpy(fixed_array)[None, None].float()
+                    moving_tensor = torch.from_numpy(moving_array)[None, None].float()
+                    if tuple(fixed_tensor.shape[2:]) != tuple(target_size):
+                        fixed_tensor = torch.nn.functional.interpolate(
+                            fixed_tensor, size=tuple(target_size),
+                            mode="trilinear", align_corners=True,
+                        )
+                        moving_tensor = torch.nn.functional.interpolate(
+                            moving_tensor, size=tuple(target_size),
+                            mode="trilinear", align_corners=True,
+                        )
+                    fixed_tensor = fixed_tensor.to(device)
+                    moving_tensor = moving_tensor.to(device)
+                    with torch.enable_grad():
+                        model_output = model(moving_tensor, fixed_tensor)
+                    phi = model_output["phi"].detach().cpu()
+                    # The deformable field now lives in the CT frame, because the
+                    # model was optimised on the rigidly aligned pair.  Converting
+                    # it with the *original* MR geometry would re-introduce the
+                    # frame error that the rigid step just removed.
+                    learned = displacement_to_fixed_grid(phi, fixed, aligned)
+                    field = compose_rigid_and_deformable(transform, learned, fixed)
+                    fold_stats = grid_folding_statistics(phi)
             else:
                 sample = dataset[case_index[case.case_id]]
                 if sample.get("spatial_augmented"):
@@ -431,8 +491,14 @@ def run_configuration(
             }
             if fold_stats is not None:
                 entry.update(fold_stats)
-            if config.mode == "model":
+            if config.mode in ("model", "prealign_model"):
                 entry["loss"] = float(model_output["loss"])
+            if rigid_field is not None:
+                from medreglab.evaluation.prealign import field_statistics
+
+                rigid_stats = field_statistics(rigid_field)
+                entry["rigid_magnitude_mm"] = rigid_stats["rigid_magnitude_mm"]
+                entry["rigid_mean_displacement_mm"] = rigid_stats["mean_displacement_mm"]
             entry["elapsed_seconds"] = round(time.perf_counter() - case_start, 3)
             if device == "cuda" and torch.cuda.is_available():
                 entry["peak_gpu_gib"] = round(

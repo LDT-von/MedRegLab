@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from medreglab.evaluation.dev_eval import (  # noqa: E402
-    DEFAULT_CONFIGS,
+    ALL_CONFIGS,
     EvaluationError,
     config_by_name,
     run_configurations,
@@ -56,7 +56,7 @@ def main() -> int:
         )
         return 2
 
-    configs = DEFAULT_CONFIGS
+    configs = ALL_CONFIGS
     if args.configs:
         try:
             configs = tuple(config_by_name(name) for name in args.configs)

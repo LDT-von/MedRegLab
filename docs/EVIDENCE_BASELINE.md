@@ -529,6 +529,51 @@ python -m pytest tests/test_dev_eval_harness.py tests/test_evaluation_protocol.p
 | `tests/test_inference_contract.py::test_native_dsc_resamples_each_physical_axis_to_the_expected_voxel` | 物理空间评分的 x/y/z 三个方向；立方等距网格、非立方非等距 spacing、非单位方向矩阵；用**非对称**合成标签并断言**预期重采样体素位置**；并断言沿错误物理轴拉取**不能**复现解剖 |
 | `tests/test_inference_contract.py::test_native_dsc_rejects_geometry_mismatch` | 分割几何与图像不一致时报错；器官集合不完整时报错 |
 | `tests/test_dev_eval_harness.py`（9 项） | 开发集评估工具的端到端合成测试：病例收集与哈希、几何差异检测、两个基线的区分、逐例配对对比、拒绝覆盖非空目录、缺标签时报错、DSC30 取整 |
+| `tests/test_prealign.py`（6 项） | 刚性预对齐：刚性+形变场**精确组合**对逐体素暴力参考、纯平移下组合退化为加法、网格不匹配时报错、位移场与 `sitk.Resample` 等价、归一化与数据集口径一致、预对齐配置为**可选**而非固定集合 |
+
+---
+
+## 7.1 刚性预对齐（可选，本轮新增）
+
+在开发集对比中额外发现一个**结构性**问题：
+
+`displacement_to_fixed_grid` 是从**索引对应**出发的。当 CT 与 MR
+共享物理坐标系时该对应近似正确；当两者**不共享**时，
+它根本不是解剖对应，转换出的场会带上一大块刚性误差，
+TV 正则化再强也去不掉（TV 只能压平滑，不能纠正刚体错位）。
+
+因此新增 `medreglab/evaluation/prealign.py`：
+
+- 用 **Mattes 互信息**（CT 与 MR 强度非线性相关，不能用 MSE）
+  估计 CT→MR 的**刚性**变换，**只读图像，不读标签**；
+- 用 `sitk.TransformToDisplacementField` 把它转成提交格式的
+  物理 pull 场 `D(p) = T(p) - p`，与 `displacement_to_fixed_grid` 同一约定；
+- 形变优化在**刚性对齐后**的配对上进行，其位移场已处于 CT 坐标系，
+  再用**精确组合** `D(p) = R(p + u(p)) - p` 合回提交格式。
+
+### 组合函数的轴序缺陷（本轮自查发现并修复）
+
+初版组合函数对形变场做了**两次轴翻转**（`[::-1, ::-1, ::-1, :]`）。
+- 对**纯平移**而言，两次翻转**互相抵消**，结果恰好正确 →
+  平移测试完全测不出问题；
+- 一旦刚性部分**含旋转**，该写法就产生**错误的轴序**，
+  实测在 90° 旋转下把 `[-1, 1, 0]` 变成 `[-8, 0, 0]`。
+
+修复：numpy 数组的 `(z, y, x, component)` 顺序与
+`points[z, y, x]` 本来就一致，**不需要翻转也不需要转置**。
+
+回归测试 `tests/test_prealign.py::test_composition_matches_brute_force_under_rotation`
+用**逐体素暴力参考**对照，**已实测**把旧写法代入会使该用例失败。
+
+> 这与 §3 的轴序缺陷属于**同一类错误**（轴序），
+> 只是这次发生在**新写的**代码里而不是历史代码里。
+> 记录在此以便追溯。
+
+### 预对齐配置的定位
+
+`P1_prealign` / `P2_prealign_C1` **不属于** §5.5 的固定配置集合，
+必须用 `--configs` 显式指定。它们是**待检验的假设**，不是既定结论：
+刚性配准是否真的能提高 DSC/DSC30，必须由实际运行给出。
 
 ---
 
@@ -549,5 +594,7 @@ python -m pytest tests/test_dev_eval_harness.py tests/test_evaluation_protocol.p
 | 0.396 / 0.400 是独立验证集或测试集结果 | **否**（无产物 + 无独立 val 划分，§2.4） |
 | 当前折叠率 4.1%–11.2%、min_jacobian 低至 -102.6 | **已核对本轮运行产物**（§4） |
 | 开发集评估工具的端到端流程可用 | **已用合成数据验证**（§7） |
+| 刚性预对齐的组合函数在旋转下正确 | **已用逐体素暴力参考验证**（§7.1）；旧写法会失败 |
+| 刚性预对齐能提高 DSC / DSC30 | **未知**，需在开发集上实测 |
 | 增大 TV 是否提高 DSC | **未知**，由 §5 实验检验 |
 | 「差异 < 0.01」能否断言模型无实质差异 | **不能**（仅为预先约定的工程阈值，§5.8 第 4 条） |

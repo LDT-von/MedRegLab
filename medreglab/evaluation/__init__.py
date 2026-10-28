@@ -12,7 +12,9 @@ from .dsc_evaluator import (
     competition_case_dice,
 )
 from .dev_eval import (
+    ALL_CONFIGS,
     DEFAULT_CONFIGS,
+    PREALIGN_CONFIGS,
     ConfigResult,
     EvalConfig,
     EvaluationError,
@@ -34,7 +36,9 @@ __all__ = [
     "dice_coefficient",
     "dice_per_organ",
     "competition_case_dice",
+    "ALL_CONFIGS",
     "DEFAULT_CONFIGS",
+    "PREALIGN_CONFIGS",
     "ConfigResult",
     "EvalConfig",
     "EvaluationError",
