@@ -250,6 +250,69 @@ python scripts/dev_eval_run.py --data Datasets --output outputs/dev_eval_<RUN_ID
 
 ---
 
+## 🧭 器官概率驱动的配准（当前主力方案）
+
+`convex_3d` 的**强度相似度**在本数据上条件很差：017–032 的 CT 与 MR
+处于**不同的物理坐标系**（原点相差数百毫米，如 017 相差约 734 mm），
+单次梯度搜索要么停在平坦区、要么收敛到错误盆地。
+这正是开发集上 `A_zero_physical` 有 8/24 例恰好为 **0.0** 的原因——
+而 DSC30 恰好取**最低的 8 例**，因此这些病例直接决定了分数。
+
+当前主力方案改为**器官概率驱动**：
+
+1. 单模态器官分割网络分别预测 CT 与 MR 的肝 / 脾 / 肾概率图
+   （**只在公开训练集上训练**，隐藏测试标签从未被读取）；
+2. 器官质心给出把两个解剖结构对齐的初始平移；
+3. 以模态无关的 MIND 特征做由粗到细的搜索，器官概率作为附加特征通道；
+4. 在该初值上优化稠密位移场。
+
+### 开发集实测（同源组 017–024，8 例真标签）
+
+> 017–024 与测试集 025–032 **同源**，是最有代表性的开发代理集；
+> 但这是**开发集**，不是独立验证集。
+
+| 阶段 | DSC | DSC30 |
+|---|---|---|
+| identity（零位移） | 0.0000 | 0.0000 |
+| 仅平移 | 0.7479 | 0.6844 |
+| 凸搜索 | 0.8492 | 0.8160 |
+| **最终形变场** | **0.8832** | **0.8518** |
+
+对照原 `C1_current` 配置（DSC 0.4866 / DSC30 0.1673）。
+上表由 **MedRegLab 官方评分器独立复算**（`competition_case_dice` +
+`DSC30_Scorer`），与配准引擎自报数字逐位一致。
+
+### 运行
+
+```bash
+# 1) 生成 8 例测试集位移场（原始 CT 网格、mm、拉取约定）
+python experiments/organ_guided_inference.py \
+  --data Datasets --output outputs/organ_guided_test_<RUN_ID> \
+  --engine <ctmr 引擎路径> --predictions <器官概率图目录> \
+  --split test --gpu 0 \
+  --settings seg_weight=2 affine_mode=none io_lambda=2 io_iters=500 reg_sp=1.5
+
+# 2) 用官方打包器生成规范 ZIP
+python experiments/package_submission.py \
+  --inference outputs/organ_guided_test_<RUN_ID> \
+  --data Datasets --output outputs/submission_<RUN_ID>
+
+# 3) 不重跑配准，从 ZIP 独立复核
+python experiments/verify_submission.py \
+  --zip outputs/submission_<RUN_ID>/submission.zip --data Datasets
+```
+
+`verify_submission.py` 会从打包好的 ZIP 重新读取每个场，逐例校验
+几何与原 CT 完全一致、float32×3、全部有限、物理点映射落在 MR 视野内、
+且场确实随空间变化（排除纯常数偏移）。
+
+> **口径提醒**：008 号及以后的原始标签里 `1=双肾 / 3=肝`，
+> 与官方文档写的 `1=肝 / 3=肾` 相反（001–008 才是文档口径）。
+> 这**不影响分数**——Dice 对 CT 与 MR 两侧一致的标签置换不变——
+> 但按字面语义解读器官时必须注意。
+
+---
+
 ## 📊 支持的模态
 
 - 比赛数据加载器固定 CT、浮动 MR；其他数据需自行核对模态预处理与几何关系。
