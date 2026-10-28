@@ -278,6 +278,49 @@ RuntimeError: expected scalar type Double but found Float
 **修复**：训练脚本按 `trainable_params` 是否为空决定是否建优化器与反向传播；
 验证阶段改用 `torch.enable_grad()`；无参数时不再保存空 checkpoint。
 
+### 6.18 标签形变的坐标轴顺序与归一化除数（曾使 DSC 被严重低估）
+
+> 本节恢复自提交 `336047c`（备份：`backup/local-master-336047c`）。
+> 缺陷本身已用合成数据**复算确认**（见 [EVIDENCE_BASELINE.md §3.2](EVIDENCE_BASELINE.md)）。
+> 提交信息中「identity 0.15 → 0.40」这一对具体数字**未能复现**，属待核实。
+
+DSC 计算走 `infer_competition._apply_deformation_to_label`，
+它把 moving 分割按 `phi` 形变到 fixed 空间。该函数与参考实现
+`convex_3d_working.Simple3DRegistration._warp` 有两处不一致：
+
+| 项 | 错误写法 | 正确写法 |
+|---|---|---|
+| grid 最后一维 | `(D, H, W)` | `(W, H, D)` = `(x, y, z)` |
+| 归一化除数 | `x/D, y/H, z/W` | `x/W, y/H, z/D` |
+
+`F.grid_sample` 的 3D 约定要求 grid 为 `[B, D, H, W, 3]` 且最后一维是
+`(x, y, z) = (W, H, D)`。写反会让 **D 与 W 轴互换**。
+
+**复算结果**（identity 位移场下，正确实现的 Dice 必然为 1.0）：
+
+| 网格 | 器官 | 错误版 Dice | 修复版 Dice |
+|---|---|---|---|
+| 64³（真实 mask） | liver / spleen / kidney | 0.5756 / **0.0000** / 0.0443 | 1.0 / 1.0 / 1.0 |
+| 原生 CT 192×160×192 | liver | 0.5811 | 1.0 |
+
+即该缺陷**在立方体网格上同样成立**，并非只在非立方体数据上出现。
+（用「居中立方体」造出的对称 mask 测试会漏掉这个 bug，
+必须用**非对称**的真实器官形状才能暴露。）
+
+**影响**：修复前的 DSC 数字被测量方式严重低估，并非模型效果。
+
+**修复**（提交 `a2226a4`）：`infer_competition._apply_deformation_to_label` 与
+`train_competition._warp_label` 同步改正；新增回归测试
+`tests/test_medreglab.py::test_label_warp_axis_order` 逐轴验证形变方向。
+
+> ⚠️ **当前状态**：该缺陷在 `6933cfe` 中**已修复**
+> （两处 warp 均改为 `z, y, x = torch.meshgrid(...)` +
+> `torch.stack((x, y, z), dim=-1)`，除数 `2/(width-1), 2/(height-1), 2/(depth-1)`）。
+> 但 `336047c` 引入的 `test_label_warp_axis_order`
+> 在上游重写时**被删除**，`6933cfe` 的测试套件中目前**未见逐轴验证**。
+> 建议补一条**非对称** mask 的逐轴回归测试，见
+> [EVIDENCE_BASELINE.md §6](EVIDENCE_BASELINE.md)。
+
 ---
 
 ## 7. 清理记录：删除了什么、为什么
