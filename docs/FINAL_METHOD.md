@@ -65,6 +65,8 @@
 └── requirements.txt
 ```
 
+另有 `/data/ctmr/run_final.sh`（最终方案一键脚本，在 `code/` 之外）。
+
 ### 2. 模型权重（**不可重建，必须保留**）
 
 ```
@@ -92,10 +94,11 @@
 
 | 路径 | 说明 |
 |---|---|
-| `/data/ctmr/preds/ens/` | 器官概率图（20M），可由权重 + cache 重建 |
+| `/data/ctmr/preds/ens/` | 器官概率图（20M），可由权重 + cache 重建；**重建非逐位可复现**（见 §5.1） |
 | `/data/ctmr/cache/seg_1.5x1.5x3.0/` | 预处理缓存（958M），可由 Datasets 重建 |
-| `/data/ctmr/Datasets/` | 数据集副本，与 `MedRegLab/Datasets/` 相同 |
-| `/data/ctmr/env/` | 独立虚拟环境（7.4G），ctmr 侧运行所需 |
+| `/data/ctmr/run_final.sh` | 最终方案一键脚本（缓存 → 概率 → 配准） |
+| `/data/ctmr/Datasets` | **符号链接** → `/data1/MedRegLab/Datasets`（原为重复副本，已删） |
+| `/data/ctmr/env/` | 独立虚拟环境（7.4G）。⚠️ 其 torch 不支持 RTX 5090，实际用 MedRegLab 的 `.venv` |
 
 ---
 
@@ -118,7 +121,15 @@
 
 ## 五、复现最终方案的步骤
 
-依赖：`/data/ctmr/env`（或等效环境）、`Datasets/`、20 个分割权重。
+> **一键脚本**：`bash /data/ctmr/run_final.sh`（含缓存检查 → 器官概率 → 配准三步）。
+>
+> ⚠️ **环境注意**：`/data/ctmr/env` 的 torch 2.6.0+cu124 只编译到 `sm_90`，
+> **不支持本机 RTX 5090（sm_120）**，直接运行会报
+> `no kernel image is available for execution on the device`。
+> 请改用 `/data1/MedRegLab/.venv`（torch 2.10.0+cu128，支持 sm_120）。
+> `run_final.sh` 已默认使用后者，可用 `PY=` 覆盖。
+
+依赖：`Datasets/`、20 个分割权重（`/data/ctmr/runs/seg_*/last.pt`）。
 
 ```bash
 # 1. 预处理缓存（若已删除）
@@ -143,6 +154,25 @@ cd /data1/MedRegLab
     --inference outputs/organ_guided_best_test_20261029 \
     --data Datasets --output outputs/submission_organ_best_20261029
 ```
+
+### 5.1 可复现性：实测结论（2026-11-01）
+
+**重跑能得到同等质量的场，但不是逐位相同。** 实测数据：
+
+| 环节 | 复现情况 |
+|---|---|
+| 分割概率图（同一权重、同一命令跑两次） | **不可复现**：2.77% 体素概率值不同（最大差 255/255） |
+| 由此产生的位移场 | 与交付包差异 **11.8–19.5 mm**（场均值差异 < 0.1 mm） |
+| 器官概率固定后重跑配准 | case 030 体素最大差异 **0.0 mm**（完全一致） |
+
+根因：GPU 上 `sliding_window` 滑窗推理的浮点累加顺序不确定，导致概率图末位差异；
+该差异经器官质心与搜索初值放大为毫米级场差异。
+
+**因此**：
+
+- **交付的 `submission.zip` 是唯一权威产物**，其 SHA256 与 8 例场的哈希链完整、校验通过；
+- 重跑得到的包**不应**用来替换交付包（哈希会变，且质量仅有概率性等价保证）；
+- 若需重新提交，应以本包为准；重跑仅用于验证流程连通性。
 
 ---
 
