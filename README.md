@@ -7,11 +7,21 @@
 
 ## 🎯 当前状态
 
+> **🏆 最终方案（2026-11-01 定版）**：**器官概率引导的跨模态配准**。
+> 完整方法说明、开发集成绩、保留资产清单与复现步骤见
+> **[docs/FINAL_METHOD.md](docs/FINAL_METHOD.md)**。
+> 其余候选方法与结果文件已清理。
+
 | 项 | 说明 |
 |---|---|
-| 可用模型 | `convex_3d`（3D 配准，逐图优化 + TV 正则） |
+| 最终方法 | 器官概率引导配准（`ctmr.v2.register`，`init=seg`，`seg_weight=2`） |
+| 提交包 | `outputs/submission_organ_best_20261029/submission.zip`（867.5 MiB） |
+| 开发集成绩 | DSC **0.8832** / DSC30 **0.8518**（017–024，GT 评分；非独立验证、非测试集成绩） |
+| 算法代码 | `/data/ctmr/code`（已纳入 git，commit `8ad2831`） |
+| 模型权重 | `/data/ctmr/runs/seg_{ct,mr}_f{0,1,2,3,all}_{v1,v1s1}/last.pt`（20 个，1.3G） |
+| 可用模型（仓库内） | `convex_3d`（3D 配准，逐图优化 + TV 正则） |
 | 逐例诊断 | `experiments/train_competition.py`（不训练网络权重） |
-| 推理 / 提交 | `experiments/infer_competition.py` / `experiments/package_submission.py` |
+| 推理 / 提交 | `experiments/organ_guided_inference.py` / `experiments/package_submission.py` |
 | 数据 | `Datasets/`：train 24 例配对、test 8 例、unpaired CT 50 / MR 40 |
 | 自检 | `bash selfcheck.sh`（默认仅合成数据；可选 `--data Datasets` 检查目录） |
 
@@ -176,11 +186,10 @@ python experiments/package_submission.py \
 因此 `package_submission.py` 无需改动即可打包。
 任一病例失败时**不写** `inference_summary.json`，打包步骤会拒绝执行。
 
-> **交付的 C1 与 B 两个包的用途不同**：
-> C1（`outputs/submission_20261028_065511`）是**已配准**结果；
-> B（`outputs/submission_B_20261028`）是**几何对齐基线**，不含任何学习到的形变。
-> 两者都是**合法格式**的提交包，但隐藏测试集得分未知，
-> 主办方评分前无法判断哪个更高。
+> **历史说明**：C1（`outputs/submission_20261028_065511`）与 B（`outputs/submission_B_20261028`）
+> 两个包均为**合法格式**，但隐藏测试集得分未知，主办方评分前无法判断哪个更高。
+> 2026-11-01 已定版为**器官概率引导配准**方案（见 [docs/FINAL_METHOD.md](docs/FINAL_METHOD.md)），
+> 上述两个历史包与其余候选包已随结果文件清理一并删除，本节仅保留生成方法备查。
 
 
 > **DSC30 取整口径**：`ceil(total × 0.3)`，即 24 例取最低 **8** 例、

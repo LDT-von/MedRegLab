@@ -270,6 +270,10 @@ identity 断言与 3 个方向的平移断言**全部失败**（4/4），
 
 ## 4. 当前实现的已知风险点（供下一轮参考）
 
+> **产物状态（2026-11-01 更新）**：`outputs/test_20261028_065511/inference_summary.json`
+> 已随结果文件清理删除；下表数据为当时实测记录，作为历史证据保留。
+> 关键 JSON 与日志已归档至 `/data1/final_submission_backup/evidence/`。
+
 本轮 `6933cfe` 在 8 例测试集上实际运行的结果
 （`outputs/test_20261028_065511/inference_summary.json`）：
 
@@ -451,6 +455,9 @@ identity 断言与 3 个方向的平移断言**全部失败**（4/4），
 | 位移场 | `outputs/baseline_B_test_20261028/deformation_fields/` |
 | 汇总 | `outputs/baseline_B_test_20261028/inference_summary.json` |
 | **提交包** | `outputs/submission_B_20261028/submission.zip` |
+
+> **产物状态（2026-11-01 更新）**：以上三个路径已随结果文件清理删除。
+> 基线 B 的生成脚本 `scripts/baseline_test_fields.py` 仍在仓库中，可按上方命令重新生成。
 
 `outputs/` 已被 `.gitignore` 忽略，**不入库**；另一台电脑需重新生成。
 
