@@ -96,7 +96,7 @@
 |---|---|
 | `/data/ctmr/preds/ens/` | 器官概率图（20M），可由权重 + cache 重建；**重建非逐位可复现**（见 §5.1） |
 | `/data/ctmr/cache/seg_1.5x1.5x3.0/` | 预处理缓存（958M），可由 Datasets 重建 |
-| `/data/ctmr/run_final.sh` | 最终方案一键脚本（缓存 → 概率 → 配准） |
+| `/data/ctmr/run_final.sh` | 最终方案一键脚本（缓存 → 概率 → 配准）；本仓库 `scripts/run_final.sh` 为同内容副本 |
 | `/data/ctmr/Datasets` | **符号链接** → `/data1/MedRegLab/Datasets`（原为重复副本，已删） |
 | `/data/ctmr/env/` | 独立虚拟环境（7.4G）。⚠️ 其 torch 不支持 RTX 5090，实际用 MedRegLab 的 `.venv` |
 
@@ -121,7 +121,8 @@
 
 ## 五、复现最终方案的步骤
 
-> **一键脚本**：`bash /data/ctmr/run_final.sh`（含缓存检查 → 器官概率 → 配准三步）。
+> **一键脚本**：`bash scripts/run_final.sh`（本仓库内，含缓存检查 → 器官概率 → 配准三步）。
+> 同一脚本在 `/data/ctmr/run_final.sh` 与 `/data/ctmr/code/scripts/run_final.sh` 也有副本。
 >
 > ⚠️ **环境注意**：`/data/ctmr/env` 的 torch 2.6.0+cu124 只编译到 `sm_90`，
 > **不支持本机 RTX 5090（sm_120）**，直接运行会报
