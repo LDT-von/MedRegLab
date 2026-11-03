@@ -1,0 +1,39 @@
+commit ec788be34fe9f50b3511a08ce2a23aaee22caacf
+Author:     LDT-von <LDT-von@users.noreply.github.com>
+AuthorDate: Tue Nov 3 08:05:32 2026 +0000
+Commit:     LDT-von <LDT-von@users.noreply.github.com>
+CommitDate: Tue Nov 3 08:05:32 2026 +0000
+
+    feat: 提分所需全部算法改动（对应提交包 LB-0.9325）
+    
+    本次提交固化了 2026-11-02 → 11-03 期间所有通过受控消融验证的改动，
+    是提交包 `outputs/submission_organ_best_20261103_final` 的算法版本。
+    
+    register.py:
+      - 新增 seg_dice（概率余弦匹配项）：比逐体素 SSD 对分割边界噪声鲁棒
+        权重 2<a,b>/(||a||²+||b||²) 在 a==b 时严格取 1，唯一最优解即 a==b；
+        标准 soft-Dice 不满足该性质，存在系统性偏置。
+        实测 +0.0025 DSC (t=+9.04, p=0.000, 8/0)
+      - 新增 pred_hard：预测概率先取 argmax one-hot 再参与引导。
+        与 GT 分支形态一致，切掉软概率的"不确定带"。
+        实测 +0.0025 DSC (结论 20)
+      - 新增 pred_sigma：对预测概率做高斯平滑。实测**有害**
+        (配准 DSC 0.9176→0.9059)，故最终配置取 0.0。
+      - 新增 pred_lcc：按器官保留最大连通域（肾保留 top-2），
+        抑制远处散点误检污染质心初值与梯度。默认关闭（已证伪）。
+      - 新增 anchor / lr_decay 两个旋钮（默认 0 = 关闭）。
+    
+    seg.py:
+      - 新增多尺度 TTA（sliding_window_multiscale，--scales 1.0 1.25）：
+        推理时放大视野再滑窗平均，扩大物理感受野而不改变解剖左右性。
+        实测配准 +0.0024 DSC (t=+5.39, p=0.000, 8/0)
+      - 新增 --ct-tags / --mr-tags：按模态设计集成，
+        避免混合同质量模型造成的信号稀释。
+      - 新增 --patch / --patch-preset：可自定义滑窗 PATCH。
+    
+    开发集(017-024, 域内口径)最终成绩：DSC 0.9325 / DSC30 0.9252,
+    对比原始基线 Δ=+0.0309 (t=+6.88, p=0.000, 8胜0负)。
+    
+    与前一版本 (1244d29) 的哈希差异：
+      register.py  f8f71e77... -> bab7ec50...
+      seg.py       3fb5ad03... -> 7236b993...

@@ -1,0 +1,5 @@
+The bundle contains these 2 refs:
+ec788be34fe9f50b3511a08ce2a23aaee22caacf refs/heads/master
+ec788be34fe9f50b3511a08ce2a23aaee22caacf HEAD
+The bundle records a complete history.
+The bundle uses this hash algorithm: sha1
