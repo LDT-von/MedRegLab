@@ -1,5 +1,21 @@
 # 最终方案交付清单（2026-11-01 定版）
 
+> ⚠️ **本文档已于 2026-11-03 被超越**，内容停留在 `LB-0.8832` 时代（2026-11-01 定版）。
+>
+> **当前的提交包标记与完整台账见** → [`outputs/SUBMISSION_LEDGER.md`](../outputs/SUBMISSION_LEDGER.md)
+> **提分实验记录见** → [`SCORE_IMPROVEMENT_PLAN.md`](SCORE_IMPROVEMENT_PLAN.md)
+>
+> 快速对照：
+>
+> | 标签 | 榜单 DSC / DSC30 | 开发集 DSC / DSC30 | 提交包目录 | 生成脚本 |
+> |---|---|---|---|---|
+> | **`LB-0.9073`** | **0.9073 / 0.8977** | 0.9072 / 0.8958 | `submission_organ_best_20261102` | `/data/ctmr/run_submit.sh` |
+> | **`LB-0.9325`** | 待提交 | **0.9325 / 0.9252** | `submission_organ_best_20261103_final` | `/data/ctmr/run_submit_final.sh` |
+> | `LB-0.8832`（本文档所述） | 未提交 | 0.8832 / 0.8518 | `submission_organ_best_20261029` | `/data/ctmr/run_final.sh` |
+>
+> 下文 §一~§三 描述的 `opt_c` 配置（`seg_weight=2 io_lambda=2 reg_sp=1.5`）
+> 对应的是**早期版本**，**不再是**当前最优配置。
+
 ## 结论
 
 最终采用 **器官概率引导的跨模态配准**（`opt_c` 配置），作为本赛题的最终方法。
