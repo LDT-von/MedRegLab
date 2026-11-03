@@ -174,6 +174,14 @@ pred_hard=True   pred_sigma=0.0     seg_dice=4.0
 "feat: 提分所需全部算法改动（对应提交包 LB-0.9325）"。
 工作区、冻结快照、git 对象三者哈希**完全一致** → 最优包已完全可复现。
 
+**仓库备份**：`/data/ctmr/code` 无远端，其完整备份已随 MedRegLab 入库
+（`backups/ctmr-code/`，commit `5c51eb3`）：
+- `ctmr-code-ec788be.bundle` —— 完整 Git 仓库（5 个提交历史）
+- `ctmr-code-ec788be.tar.gz` —— 纯源码快照（72 文件）
+- 已实测端到端恢复：从 GitHub 拉取 → SHA256 校验 7/7 OK → 从 bundle 克隆
+  → HEAD=`ec788be`，`register.py`/`seg.py` 哈希与期望一致，工作区干净。
+- 详见 [`backups/ctmr-code/README.md`](../backups/ctmr-code/README.md)
+
 ---
 
 ## 3. 完整包清单（含未提交版本）
